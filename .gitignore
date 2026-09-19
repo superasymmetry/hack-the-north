@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.conda-env/
+logs/
+worlds/*.zip
+*.mp4
+
+# secrets: the agent token lives here. .env.example is the tracked template.
+.env
+.env.local
