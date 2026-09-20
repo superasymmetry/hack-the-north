@@ -87,17 +87,25 @@ class Voxels:
     origin: np.ndarray                        # world coordinates of the grid's [0, 0, 0] corner
     shape: Tuple[int, int, int]
     names: Optional[np.ndarray] = None        # [x][y][z], the array shape
-    solids: Optional[frozenset] = None        # absolute coordinates, the list shape
+    cells: Optional[Dict[Tuple[int, int, int], str]] = None   # absolute coords, the list shape
 
     def contains(self, block: np.ndarray) -> bool:
         index = block - self.origin
         return bool(np.all(index >= 0) and np.all(index < np.array(self.shape)))
 
-    def solid(self, block: np.ndarray) -> bool:
-        if self.solids is not None:
-            return tuple(int(v) for v in block) in self.solids
+    def name(self, block: np.ndarray) -> str:
+        """The block at these world coordinates, namespace stripped and lowercased.
+
+        "air" for a cell neither shape reports: the list shape only lists what is solid, so
+        an absent cell is empty space, which is the one answer both shapes agree on.
+        """
+        if self.cells is not None:
+            return self.cells.get(tuple(int(v) for v in block), "air")
         i, j, k = (block - self.origin).astype(int)
-        return str(self.names[i, j, k]).split(":")[-1].lower() not in CLEAR
+        return str(self.names[i, j, k]).split(":")[-1].lower()
+
+    def solid(self, block: np.ndarray) -> bool:
+        return self.name(block) not in CLEAR
 
 
 def extent(sim) -> Optional[Sequence[int]]:
@@ -136,16 +144,19 @@ def voxels(sim, info: Dict[str, Any]) -> Optional[Voxels]:
     relative = all(np.all(np.abs(xyz) <= np.abs(ins).max()) for _, xyz in cells)
     shift = np.floor(eye).astype(int) if relative else np.zeros(3, int)
     return Voxels(corner, shape,
-                  solids=frozenset(tuple(xyz + shift) for name, xyz in cells
-                                   if name not in CLEAR))
+                  cells={tuple(xyz + shift): name for name, xyz in cells
+                         if name not in CLEAR})
 
 
-def cast(grid: Optional[Voxels], ray: Optional[Tuple[np.ndarray, np.ndarray]],
-         step: float = 0.25) -> Optional[np.ndarray]:
-    """The centre of the first solid block along `ray`, or None if it leaves the grid first.
+def hit(grid: Optional[Voxels], ray: Optional[Tuple[np.ndarray, np.ndarray]],
+        step: float = 0.25) -> Optional[Tuple[np.ndarray, str]]:
+    """(centre, block name) for the first solid block along `ray`, or None if it leaves first.
 
     A fixed-step march rather than a DDA: the grid is ~15 blocks across, so this is at most
     a hundred-odd lookups, and it runs once per goal rather than once per frame.
+
+    The name is what `identify` reads. Arrival only needs the position -- `cast` -- but what
+    the ray landed *on* is the only thing in the observation that says what was pointed at.
     """
     if grid is None or ray is None:
         return None
@@ -156,8 +167,15 @@ def cast(grid: Optional[Voxels], ray: Optional[Tuple[np.ndarray, np.ndarray]],
         if not grid.contains(block):
             return None
         if grid.solid(block):
-            return block + 0.5
+            return block + 0.5, grid.name(block)
     return None
+
+
+def cast(grid: Optional[Voxels], ray: Optional[Tuple[np.ndarray, np.ndarray]],
+         step: float = 0.25) -> Optional[np.ndarray]:
+    """Where `hit` landed, without asking what it landed on."""
+    landed = hit(grid, ray, step)
+    return None if landed is None else landed[0]
 
 
 def horizontal(here: Optional[np.ndarray], there: Optional[np.ndarray]) -> Optional[float]:

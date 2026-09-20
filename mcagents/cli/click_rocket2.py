@@ -9,13 +9,14 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from mcagents import gui  # first: see the import-order rule in gui.py
 import cv2
 
 from mcagents.agents.rocket2 import Rocket2Agent, Rocket2Config
 from mcagents.minecraft.session import EnvConfig, Session
+from mcagents.perception import identify
 
 GAZE_PYTHON = Path(__file__).resolve().parents[2] / ".gaze-env" / "bin" / "python"
 DWELL = 0.25       # seconds a pinch must hold: it flickers open while the hand moves
@@ -45,12 +46,18 @@ capture.release()
 """
 
 
-def pinch_point(frame, window="ROCKET-2") -> Optional[Tuple[int, int]]:
+def pinch_point(frame, label: Optional[Callable[[Tuple[int, int]], str]] = None,
+                window="ROCKET-2") -> Optional[Tuple[int, int]]:
     """Where a held pinch points on `frame` (RGB). None if it timed out or was cancelled.
 
     Deliberately the title the agent previews under: cv2 reuses a window by title, so the
     frozen frame stays up through the second of segmenting and the first forward pass,
     instead of the window vanishing and reopening.
+
+    :param label: what to write beside the dot for a point -- how the interaction this pinch
+        would run gets shown *before* the pinch commits to it. Called once a frame on a
+        frozen frame, so it has to stay cheap; a voxel cast is (see `mcagents.perception.
+        identify`), a model would not be.
     """
     rows, cols = frame.shape[:2]
     background = gui.to_bgr(frame)
@@ -89,6 +96,13 @@ def pinch_point(frame, window="ROCKET-2") -> Optional[Tuple[int, int]]:
             if point is not None:
                 cv2.circle(preview, point, 5, (0, 0, 255) if held else (0, 255, 0),
                            -1 if held else 1)
+                if label is not None:
+                    # Twice, thick and dark under thin and light: Minecraft is as likely to
+                    # put white sky behind this text as dark stone.
+                    at = (point[0] + 10, point[1] - 10)
+                    for color, weight in (((0, 0, 0), 3), ((255, 255, 255), 1)):
+                        cv2.putText(preview, label(point), at, cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5, color, weight, cv2.LINE_AA)
             gui.show(preview, window)
             if cv2.waitKey(20) == 27:  # ESC
                 return None
@@ -120,11 +134,20 @@ def main() -> None:
         agent = Rocket2Agent(sim, config)
         # Back to the preview after each task, so the next pinch starts from the view
         # ROCKET-2 left off at; ESC or the no-hand timeout ends the run.
-        while (point := pinch_point(agent.info["pov"])) is not None:
-            result = agent.run(point=point, interaction="Approach", stop={"steps": 200, "arrive": {"distance": 8}})
-            # An `arrive` of distance alone cannot fire without an anchor, so say which
-            # ending this was: got there, or never had a target position to measure
-            # against.
+        while True:
+            # Frozen for the length of the pinch, so the same cast answers for every frame
+            # of the preview and for the goal that comes out of it.
+            frame, info = agent.info["pov"], agent.info
+            decide = lambda at: identify.choose(sim, info, at, frame.shape, config.fov)
+            point = pinch_point(frame, label=lambda at: str(decide(at)))
+            if point is None:
+                break
+            choice = decide(point)
+            print(f"pinched {choice.block or 'nothing within reach'} -> {choice}", flush=True)
+            result = agent.run(point=point, interaction=choice.interaction, stop=choice.stop)
+            # An `arrive` of distance alone cannot fire without an anchor, so for the goals
+            # that use one say which ending this was: got there, or never had a target
+            # position to measure against.
             print(result, agent.status()["range"] or "never anchored", flush=True)
 
 
