@@ -10,36 +10,42 @@ under that pixel" exactly, for free, from the observation the sim was already pr
     agent.run(point=point, interaction=choice.interaction, stop=choice.stop)
 
 The one thing the grid cannot see is mobs: it is a *block* grid, so a ray aimed at a cow
-goes straight through it and lands on the grass behind. That miss is the signal. Pinching
-something that casts to terrain -- ground, path, plants -- means the interesting thing was
-standing in front of the terrain, because nobody pinches a grass block on purpose. So:
+goes straight through it and lands on the ground behind. That miss is the signal. A ray that
+ends on the floor found nothing on the way to it, and the pinch was aimed at whatever was
+standing there. So:
 
-    hit a built or natural structure   ->  it is that block          ->  Mine / Switch / Use
-    hit bare terrain                   ->  something was in the way  ->  Hunt
-    hit nothing inside the grid        ->  further than ~7 blocks    ->  Approach
+    hit something at or above your feet  ->  it is that block          ->  Mine / Switch / Use
+    hit the floor below your feet        ->  something was in the way  ->  Hunt
+    hit nothing inside the grid          ->  further than ~7 blocks    ->  Approach
 
-The middle rule is the one that trades correctness for having no second model. It is right
-in a world whose only mobs are the cows click_rocket2 summons, and wrong the moment you want
-to pinch the ground to walk there. When that day comes the fix is a real classifier over the
-pinched region -- OWLv2 (mcagents/perception/owlv2.py) run over a fixed label vocabulary,
+Height rather than a list of floor-looking blocks, because the material does not divide the
+way the question does: `CityCallback` paves its streets in `gray_concrete` and roofs its
+buildings with the same block, and walks them in `smooth_stone` while the hills behind are
+stone too. What a floor has in common is not what it is made of but where it is -- under
+you. A wall is not, a chest standing on the floor is not, and both stay minable and usable.
+
+The middle rule is what buys us no second model, and it costs the gesture "pinch the ground
+to walk there", which now reads as Hunt. When that matters the fix is a real classifier over
+the pinched region -- OWLv2 (mcagents/perception/owlv2.py) run over a fixed label vocabulary,
 picking the box that contains the point -- dropped in behind the same `choose()` signature.
 """
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+import numpy as np
+
 from mcagents.minecraft import ranging
 
-#: Blocks that mean "this is just the world", i.e. the ray found no target and whatever was
-#: pinched is standing on them. Ground, the plants growing out of it, and the surfaces a city
-#: paves with -- CityCallback lays streets, and a cow on a street casts to the street.
+#: Ground even when it is not below you: the plants a mob stands *in* rather than on, which
+#: a flat-ish ray reaches at your own height and which nobody pinches on purpose. The blocks
+#: you walk on need no list at all -- see the height rule in `is_floor`.
 TERRAIN = frozenset({
-    "grass_block", "dirt", "coarse_dirt", "rooted_dirt", "podzol", "mycelium", "mud",
-    "dirt_path", "grass_path", "farmland", "sand", "red_sand", "gravel", "clay",
-    "snow", "snow_block", "powder_snow", "ice", "packed_ice", "blue_ice", "moss_block",
     "grass", "short_grass", "tall_grass", "fern", "large_fern", "dead_bush", "seagrass",
+    "snow", "powder_snow", "sweet_berry_bush", "sugar_cane", "wheat", "vine",
     "dandelion", "poppy", "blue_orchid", "allium", "azure_bluet", "oxeye_daisy",
     "cornflower", "lily_of_the_valley", "sunflower", "lilac", "rose_bush", "peony",
-    "red_tulip", "orange_tulip", "white_tulip", "pink_tulip", "sweet_berry_bush",
+    "red_tulip", "orange_tulip", "white_tulip", "pink_tulip",
 })
 
 #: Suffixes of blocks you operate rather than break. Suffix matching rather than a list
@@ -79,24 +85,38 @@ class Choice:
         return f"{self.interaction} ({self.reason})"
 
 
-def block_at(sim, info: Dict[str, Any], point: Sequence[float], shape: Sequence[int],
-             fov: float = 70.0) -> Optional[str]:
-    """The block the pointed pixel lands on, or None if the ray leaves the grid first.
+def probe(sim, info: Dict[str, Any], point: Sequence[float], shape: Sequence[int],
+          fov: float = 70.0) -> Optional[Tuple[np.ndarray, str]]:
+    """(block centre, block name) for the pointed pixel, or None if the ray hits nothing.
 
     None covers three cases that behave the same way -- further than the grid reaches, a sim
     built without VoxelsCallback, and a sim not reporting a position -- and all three mean
     the same thing here: nothing is known about the target, so walk toward it.
     """
-    landed = ranging.hit(ranging.voxels(sim, info),
-                         ranging.view_ray(info, point, shape, fov))
-    return None if landed is None else landed[1]
+    return ranging.hit(ranging.voxels(sim, info),
+                       ranging.view_ray(info, point, shape, fov))
 
 
-def interaction_for(block: Optional[str]) -> Tuple[str, str]:
-    """(interaction, why) for a block name. See the module docstring for the three rules."""
+def is_floor(centre: Optional[np.ndarray], info: Dict[str, Any]) -> bool:
+    """Whether a hit block is ground the player could be standing on rather than a target.
+
+    Strictly *below* the feet, not at them: `player_pos` reports the feet, so the block you
+    stand on is one lower, and a block level with your feet is something sitting on the
+    floor -- a chest, the bottom course of a wall -- which is a target like any other. The
+    comparison is on block coordinates, so a cow up a step or down a kerb still reads as a
+    cow; only a target a whole block above your feet reads as itself.
+    """
+    feet = ranging.position(info)
+    if centre is None or feet is None:
+        return False
+    return math.floor(centre[1]) < math.floor(feet[1])
+
+
+def interaction_for(block: Optional[str], floor: bool = False) -> Tuple[str, str]:
+    """(interaction, why) for a hit. See the module docstring for the three rules."""
     if not block:
         return "Approach", "nothing within reach"
-    if block in TERRAIN:
+    if floor or block in TERRAIN:
         return "Hunt", f"a mob standing on {block}"
     if block in CRAFTING:
         return "Craft", block
@@ -131,6 +151,7 @@ def stop_for(interaction: str, info: Dict[str, Any]) -> Dict[str, Any]:
 def choose(sim, info: Dict[str, Any], point: Sequence[float], shape: Sequence[int],
            fov: float = 70.0) -> Choice:
     """The whole decision: cast the pointed pixel, name what it hit, pick a goal for it."""
-    block = block_at(sim, info, point, shape, fov)
-    interaction, reason = interaction_for(block)
+    landed = probe(sim, info, point, shape, fov)
+    block = None if landed is None else landed[1]
+    interaction, reason = interaction_for(block, is_floor(landed and landed[0], info))
     return Choice(interaction, stop_for(interaction, info), block, reason)

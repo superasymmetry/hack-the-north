@@ -28,17 +28,20 @@ class StubSim:
         self.callbacks = [type("VoxelsCallback", (), {"voxels_ins": [-reach, reach] * 3})()]
 
 
-def scene(block=None, at=(0, 1, 3), reach=REACH, stats=()):
+def scene(block=None, at=(0, 1, 3), reach=REACH, stats=(), floor=None, pitch=0.0):
     """A player looking down +z with one named block in front of them, or empty air.
 
     `at` is a block offset from the player's feet, so y=1 is eye level -- where a ray cast
-    straight ahead lands. Which offset a real target sits at does not matter to `identify`:
-    the verdict comes from the block's *name*, and the geometry is `ranging`'s problem.
+    straight ahead lands, and where a target standing in front of you is. `floor` paves the
+    whole y=-1 layer, which is the block you are standing on: a ray aimed downward reaches
+    it wherever it is pointed, exactly as one aimed at a cow does.
     """
     names = np.full((2 * reach + 1,) * 3, "minecraft:air", dtype=object)
+    if floor is not None:
+        names[:, reach - 1, :] = f"minecraft:{floor}"
     if block is not None:
         names[tuple(np.array(at) + reach)] = f"minecraft:{block}"
-    info = {"player_pos": {"x": 100.5, "y": 64.0, "z": 200.5, "yaw": 0.0, "pitch": 0.0},
+    info = {"player_pos": {"x": 100.5, "y": 64.0, "z": 200.5, "yaw": 0.0, "pitch": pitch},
             "voxels": {"block_name": names}}
     for stat in stats:
         info[stat] = {}
@@ -72,12 +75,33 @@ def check_the_three_rules() -> None:
     assert choose("iron_ore").interaction == "Mine"
     assert choose("stone_bricks").interaction == "Mine"
     # The headline case: a cow occupies no block, so the ray goes through it to the ground.
-    grass = choose("grass_block")
-    assert grass.interaction == "Hunt", grass
-    assert grass.block == "grass_block"
+    # The ground here is what CityCallback walks its streets with, and the buildings in the
+    # same city are concrete -- so this cannot be decided by the block's name.
+    cow = identify.choose(StubSim(), scene(floor="smooth_stone", pitch=25.0), CENTRE, FRAME)
+    assert cow.interaction == "Hunt", cow
+    assert cow.block == "smooth_stone"
+    # Plants are the exception the name list still exists for: a mob stands *in* them, so
+    # they come back at eye height rather than under your feet.
+    assert choose("tall_grass").interaction == "Hunt"
     # Nothing within the grid at all -- further away than the voxels reach.
     far = choose(None)
     assert far.interaction == "Approach" and far.block is None, far
+
+
+def check_height_beats_material() -> None:
+    """The same block is floor under your feet and a target at them. Nothing else changes."""
+    paving = "gray_concrete"        # CityCallback's roads -- and its roofs
+    under = identify.choose(StubSim(), scene(floor=paving, pitch=25.0), CENTRE, FRAME)
+    assert under.interaction == "Hunt", under
+    # Level with the feet, i.e. standing on the floor rather than being it: a target.
+    on = identify.choose(StubSim(), scene(paving, at=(0, 0, 3), floor=paving, pitch=20.0),
+                         CENTRE, FRAME)
+    assert on.block == paving and on.interaction == "Mine", on
+    # A chest on the floor stays a chest, and a door in a wall stays a door.
+    for block, expected in (("chest", "Use"), ("oak_door", "Switch")):
+        hit = identify.choose(StubSim(), scene(block, at=(0, 0, 3), floor=paving, pitch=20.0),
+                              CENTRE, FRAME)
+        assert hit.block == block and hit.interaction == expected, hit
 
 
 def check_operables() -> None:
@@ -95,13 +119,13 @@ def check_stops_match_the_interaction() -> None:
                                  "arrive": {"distance": identify.ARRIVE}}
     # No statistics in this sim's info, so a stat stop would never fire: budget instead.
     assert choose("oak_log").stop == {"steps": identify.BUDGET}
-    assert choose("grass_block").stop == {"steps": identify.BUDGET}
+    assert choose("tall_grass").stop == {"steps": identify.BUDGET}
     # With the counters present, the goal ends on the event rather than the clock. The empty
     # match is deliberate -- see stop_for -- so "any kill" ends a Hunt.
     mining = identify.choose(StubSim(), scene("oak_log", stats=("mine_block",)), CENTRE, FRAME)
     assert mining.stop == {"stat": "mine_block", "count": 1}, mining.stop
-    hunting = identify.choose(StubSim(), scene("grass_block", stats=("kill_entity",)),
-                              CENTRE, FRAME)
+    hunting = identify.choose(StubSim(), scene(floor="smooth_stone", pitch=25.0,
+                                                stats=("kill_entity",)), CENTRE, FRAME)
     assert hunting.stop == {"stat": "kill_entity", "count": 1}, hunting.stop
 
 
@@ -116,7 +140,8 @@ def check_degrades_without_voxels() -> None:
 
 
 def main() -> int:
-    for check in (check_block_names_come_back, check_the_three_rules, check_operables,
+    for check in (check_block_names_come_back, check_the_three_rules,
+                  check_height_beats_material, check_operables,
                   check_stops_match_the_interaction, check_degrades_without_voxels):
         check()
         print(f"  {check.__name__} ok")
