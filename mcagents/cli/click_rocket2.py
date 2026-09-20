@@ -65,7 +65,8 @@ def pinch_point(frame, window="ROCKET-2") -> Optional[Tuple[int, int]]:
             latest[0] = (float(x), float(y), pinched == "1")
 
     threading.Thread(target=read, daemon=True).start()
-    held, last = 0.0, time.monotonic()
+    # A pinch left over from the last task must open before it can point again.
+    ready, held, last = False, 0.0, time.monotonic()
     deadline = last + TIMEOUT
     try:
         while (now := time.monotonic()) < deadline:
@@ -77,7 +78,8 @@ def pinch_point(frame, window="ROCKET-2") -> Optional[Tuple[int, int]]:
                 x, y, pinched = sample
                 point = (min(max(int(x * cols), 0), cols - 1),
                          min(max(int(y * rows), 0), rows - 1))
-                held = held + elapsed if pinched else 0.0
+                ready = ready or not pinched
+                held = held + elapsed if pinched and ready else 0.0
                 if held >= DWELL:
                     return point
             if not gui.GUI_READY:
@@ -116,13 +118,14 @@ def main() -> None:
         # the target is still where it was -- let the stop conditions decide instead.
         config.lock_grace = 10 ** 9
         agent = Rocket2Agent(sim, config)
-        point = pinch_point(agent.info["pov"])
-        if point is None:
-            return
-        result = agent.run(point=point, interaction="Approach", stop={"steps": 200, "arrive": {"distance": 8}})
-        # An `arrive` of distance alone cannot fire without an anchor, so say which ending
-        # this was: got there, or never had a target position to measure against.
-        print(result, agent.status()["range"] or "never anchored", flush=True)
+        # Back to the preview after each task, so the next pinch starts from the view
+        # ROCKET-2 left off at; ESC or the no-hand timeout ends the run.
+        while (point := pinch_point(agent.info["pov"])) is not None:
+            result = agent.run(point=point, interaction="Approach", stop={"steps": 200, "arrive": {"distance": 8}})
+            # An `arrive` of distance alone cannot fire without an anchor, so say which
+            # ending this was: got there, or never had a target position to measure
+            # against.
+            print(result, agent.status()["range"] or "never anchored", flush=True)
 
 
 if __name__ == "__main__":
