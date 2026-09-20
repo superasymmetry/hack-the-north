@@ -18,6 +18,7 @@ other:
     {"item": "log", "count": 3, "mode": "total"}   three logs in total
     {"stat": "kill_entity", "match": "sheep", "count": 1}
     {"arrive": {"width": 0.6}}               the locked target's box is 60% of the frame wide
+    {"arrive": {"distance": 3}}              the agent is within 3 blocks of the target
     {"steps": 800, "arrive": {"width": 0.6}} whichever comes first
     callable(agent) -> bool                  anything else
 
@@ -43,8 +44,10 @@ StopFn = Callable[["Agent"], Optional[str]]
 
 STOP_KEYS = {"steps", "item", "count", "mode", "stat", "match", "arrive"}
 
-#: The keys an `arrive` object may carry: fractions of the frame the target's box must reach.
-ARRIVE_KEYS = {"width", "height"}
+#: The keys an `arrive` object may carry: `width` and `height` are fractions of the frame the
+#: target's box must reach, `distance` is blocks between the agent and the target's world
+#: position. A controller that can answer `distance` should prefer it -- see `Agent.arrived`.
+ARRIVE_KEYS = {"width", "height", "distance"}
 
 #: Reasons a goal can end. These mean the caller got what they asked for; the rest --
 #: max_steps, terminated, cancelled, replaced, lost -- mean it was cut short.
@@ -87,10 +90,11 @@ class GoalResult:
 
 
 def parse_arrive(value: Any, default_width: float) -> Optional[Dict[str, float]]:
-    """An `arrive` value as {"width": w} and/or {"height": h}, or None when switched off.
+    """An `arrive` value as {"width": w, "height": h, "distance": blocks}, or None when off.
 
     `true` is the default width, a bare number is a width, and an object names its own
-    thresholds. Every threshold is a fraction of the frame in (0, 1].
+    thresholds. Width and height are fractions of the frame in (0, 1]; distance is a positive
+    number of blocks.
     """
     if value is None or value is False:
         return None
@@ -107,7 +111,11 @@ def parse_arrive(value: Any, default_width: float) -> Optional[Dict[str, float]]
     parsed = {}
     for key, threshold in value.items():
         threshold = float(threshold)
-        if not 0.0 < threshold <= 1.0:
+        if key == "distance":
+            if threshold <= 0:
+                raise ValueError(f"arrive distance must be a positive number of blocks, "
+                                 f"got {threshold}")
+        elif not 0.0 < threshold <= 1.0:
             raise ValueError(f"arrive {key} must be a fraction of the frame in (0, 1], "
                              f"got {threshold}")
         parsed[key] = threshold
@@ -203,6 +211,11 @@ class Agent:
     #: with `arrive` is refused by one that does not, rather than silently never firing.
     supports_arrive = False
 
+    #: What `sim.step()` is given to mean "read the keyboard instead". MineStudio's
+    #: PlayCallback branches on a str or None action and passes anything else straight
+    #: through to the env, which is how an agent and a person share one sim.
+    HUMAN_ACTION = "human"
+
     def __init__(self, sim, max_steps: int = 600, verbose: bool = True):
         self.sim = sim
         self.max_steps = max_steps
@@ -273,6 +286,47 @@ class Agent:
             raise RuntimeError("a goal is running -- call step(), not idle_step()")
         return self._step_without_goal(self.sim.noop_action())
 
+    def human_step(self) -> bool:
+        """Step the world with *a person* at the controls, and say whether it is still running.
+
+        The other half of `idle_step()`. Both mean "no goal is running", and both exist for the
+        same reason -- a sim that stops stepping stops publishing frames, and whoever is
+        choosing the next goal is left planning against a still image. The difference is only
+        who presses the keys: `idle_step()` presses nothing, this hands the frame to
+        MineStudio's PlayCallback, which reads the keyboard and mouse.
+
+        That makes the hand-off between person and policy a property of what is passed to
+        `sim.step()` and nothing else: a dict is the agent driving, `HUMAN_ACTION` is the
+        person. No mode flag, no callback to reconfigure, and nothing to get out of sync --
+        whoever stepped last was in control.
+
+        `_after_step` runs either way, so the preview, the frame publisher and the gaze
+        selector carry on exactly as they do under a goal.
+        """
+        if self.busy:
+            raise RuntimeError("a goal is running -- call step(), not human_step()")
+        if not self.plays:
+            raise RuntimeError(
+                "human_step() needs a sim with a PlayCallback -- it is what reads the "
+                "keyboard. Build the sim with MinecraftSim(callbacks=[..., PlayCallback()]), "
+                "or use idle_step() to step the world with nothing pressed."
+            )
+        return self._step_without_goal(self.HUMAN_ACTION)
+
+    @property
+    def plays(self) -> bool:
+        """Whether this sim has the callback that turns `HUMAN_ACTION` into keypresses.
+
+        Matched through the whole class hierarchy rather than on the exact type: what is
+        actually in the sim is a *subclass* -- mcagents.minecraft.play.PlayWindow -- and an
+        exact name check quietly answers "no", which shows up only as the keyboard doing
+        nothing, with nothing logged to say why. By name rather than by import so the base
+        agent stays free of minestudio, the way `_check_sim` already is.
+        """
+        return any(any(ancestor.__name__ == "PlayCallback"
+                       for ancestor in type(callback).__mro__)
+                   for callback in getattr(self.sim, "callbacks", []))
+
     def turn_step(self, yaw: float, pitch: float = 0.0) -> bool:
         """Step the world with the camera turned by [pitch, yaw] degrees and nothing pressed.
 
@@ -320,7 +374,7 @@ class Agent:
         return self.result
 
     def arrived(self, thresholds: Dict[str, float]) -> bool:
-        """Whether the target fills `thresholds` of the frame. Controllers that track override."""
+        """Whether the target is within `thresholds`. Controllers that track override."""
         return False
 
     def _action(self) -> Any:

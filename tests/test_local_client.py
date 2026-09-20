@@ -41,7 +41,7 @@ from mcagents.local_client import (ClientConfig, Cue, Frame, FrameCadence, MicSo
                                    TokenRejected, Utterance, describe_goal, frame_pump,
                                    describe_status, format_reply, parse_goals, parse_reply,
                                    parse_turn_command, probe, run_goal_link, run_link,
-                                   shared_mute, starts_a_task)
+                                   describe_selection, shared_mute, starts_a_task)
 
 TOKEN = "correct-horse"
 
@@ -440,6 +440,46 @@ async def test_a_final_goes_out_ahead_of_a_frame():
     assert isinstance(first, Utterance), "a frame went ahead of a final"
     assert isinstance(await outbox.get(), Frame)
     print("  outbox: finals go ahead of a pending frame, which follows it")
+
+
+async def test_a_spoken_final_carries_what_is_being_pointed_at():
+    """"mine *that*" is two halves, and this is the half that used to be missing.
+
+    The coordinate already went up on the frames, but a frame is up to `frame_interval` old
+    and arrives as its own message, so the model had to work out for itself which picture the
+    words belonged to. Stamped onto the final, the phrase and the point are one message.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "frame.jpg")
+        frames.write(JPEG, path)
+        frames.write_selection({"point": [0.51, 0.42], "box": [0.42, 0.31, 0.6, 0.78],
+                                "locked": True, "held": True, "age": 1.4}, path)
+        config = ClientConfig(frame_path=path)
+        outbox = Outbox(asyncio.get_running_loop(),
+                        selection_of=lambda: frames.read_selection(config.frame_path,
+                                                                   config.frame_max_age))
+
+        outbox._put(Utterance("mine that", final=True))
+        final = await outbox.get()
+        assert final.payload() == {"text": "mine that", "final": True,
+                                   "selection": {"point": [0.51, 0.42],
+                                                 "box": [0.42, 0.31, 0.6, 0.78],
+                                                 "locked": True, "held": True,
+                                                 "age": 1.4}}, final.payload()
+        assert "pointing at 0.51, 0.42" in describe_selection(final.selection)
+
+        # A partial is not stamped: the server acts on finals, and a partial three times a
+        # second would re-read the channel for an answer nobody looks at.
+        outbox._put(Utterance("mine th", final=False))
+        assert (await outbox.get()).payload() == {"text": "mine th", "final": False}
+
+        # And pointing at nothing is not an error. The words still go, without a coordinate,
+        # because plenty of what gets said names its own target.
+        frames.write_selection(None, path)
+        outbox._put(Utterance("come back here", final=True))
+        assert (await outbox.get()).payload() == {"text": "come back here", "final": True}
+        assert describe_selection(None) == ""
+    print("  wire: a final carries the point that was being pointed at as it ended")
 
 
 async def test_a_frame_does_not_hold_up_ctrl_d():
@@ -1058,6 +1098,7 @@ def main():
     asyncio.run(test_a_phrase_split_at_a_pause_goes_out_as_one())
     asyncio.run(test_outbox_keeps_only_the_newest_frame())
     asyncio.run(test_a_final_goes_out_ahead_of_a_frame())
+    asyncio.run(test_a_spoken_final_carries_what_is_being_pointed_at())
     asyncio.run(test_a_frame_does_not_hold_up_ctrl_d())
     asyncio.run(test_frames_reach_the_server_as_base64_jpeg())
     asyncio.run(test_the_same_frame_is_not_sent_twice())

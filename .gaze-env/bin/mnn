@@ -1,0 +1,6 @@
+#!/home/stringbot/Documents/Github/htn/.gaze-env/bin/python
+import sys
+from MNN.tools.mnn import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

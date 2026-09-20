@@ -28,9 +28,10 @@ wrote it -- a Slurm kill, a crash, a ctrl-c all leave the last frame sitting the
 perfectly valid -- so `read_latest` refuses anything older than `max_age` instead of sending
 the model a picture of a Minecraft session that ended twenty minutes ago.
 """
+import json
 import os
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -122,6 +123,45 @@ def read_latest(path: str = DEFAULT_PATH,
         return None
 
 
+def selection_path(path: str = DEFAULT_PATH) -> str:
+    """Where the selection that goes with `path` lives."""
+    return f"{path}.json"
+
+
+def write_selection(selection: Optional[Dict[str, Any]], path: str = DEFAULT_PATH) -> None:
+    """Publish what was highlighted in the frame at `path` -- or that nothing was.
+
+    A sidecar rather than a second channel, and written by whoever writes the frame, because
+    the two only mean anything together: "the box is at (0.51, 0.42)" is a statement *about a
+    picture*, and pairing it with a different picture is worse than sending neither. Writing
+    `None` is meaningful and not a no-op -- it is how a selection that has gone away stops
+    being attached to every frame after it.
+    """
+    body = json.dumps({"selection": selection, "t": round(time.time(), 3)}).encode()
+    write(body, selection_path(path))
+
+
+def read_selection(path: str = DEFAULT_PATH,
+                   max_age: float = 10.0) -> Optional[Dict[str, Any]]:
+    """What was highlighted in the published frame, or None if nothing was.
+
+    `max_age` matches the frame's own, since a selection older than the frame it describes
+    describes a frame nobody is sending any more.
+    """
+    try:
+        with open(selection_path(path), "rb") as handle:
+            status = os.fstat(handle.fileno())
+            if not status.st_size or status.st_size > MAX_BYTES:
+                return None
+            if time.time() - status.st_mtime > max_age:
+                return None
+            body = json.loads(handle.read(MAX_BYTES))
+    except (OSError, ValueError):
+        return None
+    selection = body.get("selection") if isinstance(body, dict) else None
+    return selection if isinstance(selection, dict) else None
+
+
 class FramePublisher:
     """Rate-limited publishing of the agent's view, safe to call from the step loop.
 
@@ -147,8 +187,13 @@ class FramePublisher:
         self.published = 0
         self._last = 0.0
 
-    def offer(self, frame: Optional[np.ndarray]) -> bool:
-        """Publish `frame` if one is due. Returns whether it was written."""
+    def offer(self, frame: Optional[np.ndarray],
+              selection: Optional[Dict[str, Any]] = None) -> bool:
+        """Publish `frame`, and what was highlighted in it, if one is due.
+
+        The two go out together or not at all, so the coordinates the model is given always
+        describe the picture it is looking at. See `write_selection`.
+        """
         if not self.enabled or frame is None:
             return False
         now = time.monotonic()
@@ -156,6 +201,7 @@ class FramePublisher:
             return False
         try:
             write(encode(frame, self.quality), self.path)
+            write_selection(selection, self.path)
         except Exception as exc:                       # never take the rollout down with it
             self.enabled = False
             self.report(f"frames: publishing to {self.path} failed, giving up on it "

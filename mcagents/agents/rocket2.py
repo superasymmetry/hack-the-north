@@ -24,7 +24,14 @@ was pointed at. So an Approach goal -- or any goal with an `arrive` stop -- also
 `InstanceLock` (mcagents/perception/tracking.py): the pointed instance, followed by overlap
 and camera motion, re-segmented every few steps. It is what `arrive` measures, and when it is
 lost for longer than a short grace the goal ends as "lost" rather than following the policy
-onto a lookalike. Approach with no `arrive` of its own gets `arrive: {width: 0.6}` added.
+onto a lookalike. Approach with no `arrive` of its own gets one added.
+
+Arrival itself is a world measurement wherever it can be. The pointed pixel is cast through
+the voxel grid around the player (mcagents/minecraft/ranging.py) to the block it lands on,
+and from then on the goal knows its target's address: `distance` is `|player_pos - anchor|`
+horizontally, which turning cannot change and walking past cannot fake. The grid only
+reaches ~7 blocks, so the cast is retried each step until the target comes inside it, and a
+target that never does falls back to `width` -- the fraction of the frame its box fills.
 
 Measured on an RTX 5060 laptop (8GB), model forward only:
 
@@ -34,6 +41,7 @@ Measured on an RTX 5060 laptop (8GB), model forward only:
 See docs/rocket2.md for the wiring and mcagents/cli/rocket2.py for a runnable example.
 """
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -46,6 +54,7 @@ import torch
 from mcagents import gui
 from mcagents.agents.base import Agent, Goal, GoalResult, StopSpec, uses_arrive
 from mcagents.frames import FramePublisher
+from mcagents.minecraft import ranging
 from mcagents.perception.masking import Masker, PointMasker
 from mcagents.perception.tracking import InstanceLock, LockConfig, mask_box
 from mcagents.vendor.rocket2 import CFGWrapper, CrossViewRocket
@@ -111,14 +120,32 @@ class Rocket2Config:
     frame_interval: float = 1.0
     #: The arrival Approach gets when its stop names none: the locked target's box is this
     #: fraction of the frame wide. 0.6 is about 7 blocks from a 10-wide building and about
-    #: 2 from a 3-wide tree, i.e. "in front of it" without walking into it.
+    #: 2 from a 3-wide tree, i.e. "in front of it" without walking into it. Only a fallback
+    #: now -- see `arrive_distance`, which is preferred wherever the target has an address.
     arrive_width: float = 0.6
+    #: Blocks from the target's world position that count as arrived, when the sim carries
+    #: voxels and the target could be anchored to a block (mcagents/minecraft/ranging.py).
+    #: Measured horizontally, so it means "standing next to it" whatever the target's height.
+    #: 0 falls back to `arrive_width` everywhere.
+    arrive_distance: float = 3.0
     #: Steps between re-segmentations of the locked target (see tracking.py for the cost).
     track_every: int = 3
     #: Steps the lock may go unconfirmed before the goal ends as "lost". ~1.5 s at ~14 Hz.
     lock_grace: int = 20
     #: Vertical field of view of the game camera, for turning camera degrees into pixels.
     fov: float = 70.0
+    #: Keep following the gaze while a goal is running. Off by default: ROCKET-2's forward
+    #: is ~30 ms of every step and SAM-2's encoder is another ~90 ms, and the two together
+    #: drag the loop under the rate a person can play at. You select, then you speak.
+    gaze_during_goals: bool = False
+    #: How long a committed selection stays usable after nothing is supporting it any more --
+    #: the hand opened, the eyes left. Without it a spoken pointed task cannot work at all:
+    #: the selector drops a lock 250 ms after the pinch is released (`release_ms`), and the
+    #: round trip from "mine that" to a goal coming back down the tunnel is the ASR final,
+    #: the client's join window, the wire, the remote model and the spool poll -- seconds,
+    #: not milliseconds. So "that" has to outlive the pointing by about as long as it takes
+    #: to say it and be answered. 0 turns the hold off and makes a goal need a live pinch.
+    selection_hold_ms: float = 5000.0
 
     @classmethod
     def from_env(cls) -> "Rocket2Config":
@@ -131,9 +158,14 @@ class Rocket2Config:
             frame_interval=float(os.environ.get("MCAGENTS_FRAME_INTERVAL",
                                                 cls.frame_interval)),
             arrive_width=float(os.environ.get("ROCKET2_ARRIVE_WIDTH", cls.arrive_width)),
+            arrive_distance=float(os.environ.get("ROCKET2_ARRIVE_DISTANCE",
+                                                 cls.arrive_distance)),
             track_every=int(os.environ.get("ROCKET2_TRACK_EVERY", cls.track_every)),
             lock_grace=int(os.environ.get("ROCKET2_LOCK_GRACE", cls.lock_grace)),
             fov=float(os.environ.get("MCAGENTS_FOV", cls.fov)),
+            gaze_during_goals=os.environ.get("MCAGENTS_GAZE_DURING_GOALS", "0") != "0",
+            selection_hold_ms=float(os.environ.get("MCAGENTS_SELECTION_HOLD_MS",
+                                                   cls.selection_hold_ms)),
         )
 
 
@@ -147,11 +179,17 @@ class Subgoal(Goal):
     frame: Optional[np.ndarray] = None            # RGB, at pov resolution
     #: The pointed instance, followed frame to frame. None for goals that do not lock.
     lock: Optional[InstanceLock] = None
+    #: The target's world position as [x, y, z], once a cast has found one. Stays None for a
+    #: target that has never been inside the voxel grid, and never changes once it is set:
+    #: that is the whole point of it. See mcagents/minecraft/ranging.py.
+    anchor: Optional[np.ndarray] = None
 
     def describe(self) -> str:
+        anchor = (f" at ({self.anchor[0]:.1f},{self.anchor[1]:.1f},{self.anchor[2]:.1f})"
+                  if self.anchor is not None else "")
         return (f"{self.interaction}@({self.point[0]:.0f},{self.point[1]:.0f}) "
                 f"stop={self.stop!r} mask={int(self.mask.sum()) if self.mask is not None else 0}px"
-                f"{' locked' if self.lock is not None else ''}")
+                f"{' locked' if self.lock is not None else ''}{anchor}")
 
 
 @dataclass
@@ -184,7 +222,7 @@ class Rocket2Agent(Agent):
     supports_arrive = True
 
     def __init__(self, sim, config: Optional[Rocket2Config] = None,
-                 masker: Optional[Masker] = None, verbose: bool = True):
+                 masker: Optional[Masker] = None, verbose: bool = True, selector=None):
         self.config = config or Rocket2Config()
         self._check_sim(sim)
         super().__init__(sim, max_steps=self.config.max_steps, verbose=verbose)
@@ -207,6 +245,12 @@ class Rocket2Agent(Agent):
         # only place in the system that has both the sim and a frame worth looking at.
         self.publisher = FramePublisher(self.config.frame_interval,
                                         report=lambda message: self._log(message))
+        #: Where the person is looking, if anything is watching -- a
+        #: mcagents.perception.selection.GazeSelector, built by whoever owns the window,
+        #: since that is what knows where on screen the game is. None when nothing is.
+        self.selector = selector
+        #: The last committed selection and when it was last seen. See `held_selection`.
+        self._held: Optional[Tuple[Any, float]] = None
 
     @staticmethod
     def _check_sim(sim) -> None:
@@ -224,7 +268,9 @@ class Rocket2Agent(Agent):
     # ------------------------------------------------------------------ goals
 
     def set_goal(self, point: Sequence[float], interaction: str, stop: StopSpec = None,
-                 normalized: bool = False, keep_memory: bool = False) -> Subgoal:
+                 normalized: bool = False, keep_memory: bool = False,
+                 mask: Optional[np.ndarray] = None,
+                 frame: Optional[np.ndarray] = None) -> Subgoal:
         """Pin a new goal: segment `point` on the current frame, under `interaction`, until `stop`.
 
         :param normalized: interpret `point` as [0..1] fractions of width/height instead of
@@ -232,21 +278,45 @@ class Rocket2Agent(Agent):
         :param keep_memory: by default the recurrent state is cleared, because it holds the
             previous target and carrying it into a new goal makes the agent hesitate
             (ROCKET-2's demo exposes the same thing as its "Clear Memory" button).
+        :param mask: a segmentation somebody already has, instead of running SAM-2 again.
+        :param frame: the frame that `mask` was computed on. Required with it, and not the
+            same thing as the current frame: `Subgoal.frame` is the cross-view image the
+            policy is conditioned on, and a mask means nothing except against the pixels it
+            was drawn from.
+
+        `mask` is how a gaze selection becomes a goal. The object under your eyes has already
+        been segmented -- that is what the red box *is* -- so re-running SAM-2 on the same
+        point would cost ~113 ms to arrive at the same answer, and might not: a frame or two
+        has passed, and the second call could land on the leaf rather than the tree. Passing
+        the mask makes the goal start instantly and makes it, exactly, the thing that was
+        highlighted when the person said so.
 
         An Approach goal, or any goal whose stop has `arrive`, locks the instance under the
         point (see the module docstring). If that instance already fills the arrival width
         the goal ends here as "arrived", before a single action is taken.
         """
         self._sync()
-        frame = np.ascontiguousarray(self.info["pov"])
+        if (mask is None) != (frame is None):
+            raise ValueError("mask and frame go together: a mask means nothing except "
+                             "against the frame it was computed on")
+        given = mask is not None
+        if frame is None:
+            frame = np.ascontiguousarray(self.info["pov"])
         x, y = self.to_pixels(point, normalized)
 
         stop = self.with_default_arrival(stop, interaction)
         obj_id = interaction_id(interaction)
         self._compile_stop(stop)                      # refuse a bad goal before SAM-2 runs
-        mask = self.masker.mask(frame, (x, y))
+        if given:
+            mask = np.ascontiguousarray(mask).astype(bool)
+            if mask.shape != frame.shape[:2]:
+                raise ValueError(f"the mask is {mask.shape} but its frame is "
+                                 f"{frame.shape[:2]}; they must be the same size")
+        else:
+            mask = self.masker.mask(frame, (x, y))
         if not mask.any():
-            raise ValueError(f"the masker returned an empty mask for point ({x:.0f}, {y:.0f})")
+            whose = "the given mask is empty" if given else "the masker returned an empty mask"
+            raise ValueError(f"{whose} for point ({x:.0f}, {y:.0f})")
 
         lock = None
         if self.locks(interaction, stop):
@@ -265,6 +335,7 @@ class Rocket2Agent(Agent):
             lock=lock,
         ))
         self._camera = (0.0, 0.0)
+        self._take_anchor()
         if lock is not None and uses_arrive(stop) and self._stop(self) == "arrived":
             self.result = self._finish("arrived")
         return goal
@@ -288,9 +359,12 @@ class Rocket2Agent(Agent):
         or a dict with no `arrive` key. `"arrive": false` keeps it off; item and stat stops
         and callables are left exactly as they were.
         """
-        if str(interaction).lower() != "approach" or self.config.arrive_width <= 0:
+        if str(interaction).lower() != "approach" or max(self.config.arrive_width,
+                                                         self.config.arrive_distance) <= 0:
             return stop
         default = {"width": self.config.arrive_width}
+        if self.config.arrive_distance > 0:
+            default["distance"] = self.config.arrive_distance
         if stop is None:
             return {"arrive": default}
         if isinstance(stop, (int, np.integer)):
@@ -333,6 +407,17 @@ class Rocket2Agent(Agent):
         return {"agrees": agrees}
 
     def arrived(self, thresholds: Dict[str, float]) -> bool:
+        """Whether the target is within `thresholds` -- by world distance where it can be.
+
+        The two tests are not peers. Distance is measured between two absolute positions and
+        means what it says however the agent is facing; width is an apparent size, and grows
+        both when the agent gets close and when it merely turns until the target crops the
+        frame. So where the target has an anchor the distance is the whole answer, and width
+        only stands in for a target that has never been inside the voxel grid.
+        """
+        range_now = self.range_to_goal()
+        if range_now is not None and "distance" in thresholds:
+            return range_now <= thresholds["distance"]
         lock = self.goal.lock if self.goal is not None else None
         if lock is None or not lock.fresh:
             return False
@@ -343,6 +428,37 @@ class Rocket2Agent(Agent):
         return any(extent >= thresholds[key]
                    for key, extent in (("width", x1 - x0), ("height", y1 - y0))
                    if key in thresholds)
+
+    def range_to_goal(self) -> Optional[float]:
+        """Blocks between the agent and the goal's anchor, or None while it has none."""
+        goal: Optional[Subgoal] = self.goal
+        if goal is None or goal.anchor is None:
+            return None
+        return ranging.horizontal(ranging.position(self.info), goal.anchor)
+
+    def _take_anchor(self) -> Optional[np.ndarray]:
+        """Try to pin the running goal to a block, once. Cheap, and a no-op after it lands.
+
+        Retried while it comes back None, because "None" almost always means the target is
+        further away than the voxel grid reaches -- which walking toward it fixes. On the
+        lock's own cadence rather than every step: the march is a few thousand array lookups
+        and the agent covers ~0.2 blocks a step, so retrying oftener buys nothing.
+        """
+        goal: Optional[Subgoal] = self.goal
+        if goal is None or goal.anchor is not None or self.config.arrive_distance <= 0:
+            return None
+        if goal.steps % max(1, self.config.track_every):
+            return None
+        box = goal.lock.current_box() if goal.lock is not None else None
+        point = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) if box else goal.point
+        frame = self.info["pov"]
+        goal.anchor = ranging.cast(
+            ranging.voxels(self.sim, self.info),
+            ranging.view_ray(self.info, point, frame.shape, self.config.fov))
+        if goal.anchor is not None:
+            self._log(f"anchored the target at ({goal.anchor[0]:.1f}, {goal.anchor[1]:.1f}, "
+                      f"{goal.anchor[2]:.1f}), {self.range_to_goal():.1f} blocks away")
+        return goal.anchor
 
     def goal_box(self) -> Optional[Tuple[float, float, float, float]]:
         """The target's box as fractions of the frame: the lock's if there is one, else the
@@ -426,9 +542,80 @@ class Rocket2Agent(Agent):
         goal: Optional[Subgoal] = self.goal
         if self.busy and goal.lock is not None:
             goal.lock.advance(np.ascontiguousarray(self.info["pov"]), self._camera)
-        self.publisher.offer(self.obs["image"] if self.obs is not None else None)
+        if self.busy:
+            self._take_anchor()
+        self._follow_gaze()
+        self.publisher.offer(self.obs["image"] if self.obs is not None else None,
+                             self.selection_payload())
         if self.preview:
             self.preview = gui.show(self.overlay(), "ROCKET-2")
+
+    def _follow_gaze(self) -> None:
+        """Move the selection along with the frame, when anything is watching the eyes."""
+        if self.selector is None or (self.busy and not self.config.gaze_during_goals):
+            return
+        self.selector.update(np.ascontiguousarray(self.info["pov"]))
+        # Remembered here rather than in `_after_step` so the age means "since the pointing
+        # was last seen". `_follow_gaze` is skipped while a goal runs, which leaves the
+        # selector's own selection frozen -- and a frozen selection re-remembered every step
+        # would report an age of zero for as long as the goal lasted.
+        selection = self.selection
+        if selection is not None and selection.locked and selection.fresh:
+            self._held = (selection, time.monotonic())
+
+    @property
+    def selection(self):
+        """The object the person is looking at, or None. See perception/selection.py."""
+        return self.selector.selection if self.selector is not None else None
+
+    def held_selection(self):
+        """The last committed selection, for `selection_hold_ms` after the pointing stopped.
+
+        What makes "mine that" work when *that* was pointed at a second and a half ago: see
+        `Rocket2Config.selection_hold_ms`. Expired, it is forgotten rather than kept around
+        to be refused on every later look.
+        """
+        if self._held is None:
+            return None
+        selection, seen = self._held
+        if (time.monotonic() - seen) * 1000.0 > self.config.selection_hold_ms:
+            self._held = None
+            return None
+        return selection
+
+    def held_age(self) -> Optional[float]:
+        """Seconds since the held selection was last supported, or None if there is none."""
+        if self.held_selection() is None:
+            return None
+        return time.monotonic() - self._held[1]
+
+    def selection_payload(self) -> Optional[Dict[str, Any]]:
+        """What the remote model is told about the pointing, alongside the frame.
+
+        `held` and `age` are the difference between "they are pointing at this right now" and
+        "they were pointing at this a moment ago", which is a distinction the model has to be
+        able to make: the second is still worth resolving "that" against, and the first is the
+        only one it should trust for anything it is about to say is on screen.
+        """
+        live = self.selection
+        if live is not None:
+            return {**live.payload(), "held": False, "age": 0.0}
+        held = self.held_selection()
+        if held is None:
+            return None
+        return {**held.payload(), "held": True, "age": round(self.held_age() or 0.0, 2)}
+
+    def set_goal_from(self, selection, interaction: str, stop: StopSpec = None,
+                      keep_memory: bool = False) -> Subgoal:
+        """Run a goal against the object that is currently highlighted.
+
+        The point of the whole gaze path: the mask is already in hand, so this costs no SAM-2
+        call and the goal is aimed at exactly what the red box was around -- not at whatever
+        a second segmentation of a slightly later frame would have found there.
+        """
+        return self.set_goal(point=selection.point, interaction=interaction, stop=stop,
+                             keep_memory=keep_memory, mask=selection.mask,
+                             frame=selection.frame)
 
     def _result_extras(self) -> Dict[str, Any]:
         return {"visibility": self.visibility}
@@ -437,12 +624,16 @@ class Rocket2Agent(Agent):
 
     def status(self) -> Dict[str, Any]:
         goal: Optional[Subgoal] = self.goal
+        range_now = self.range_to_goal()
         return {
             **super().status(),
             "interaction": goal.interaction if goal else None,
             "point": list(goal.point) if goal else None,
             "visibility": round(self.visibility, 3),
             "box": [round(v, 3) for v in self.goal_box()] if self.goal_box() else None,
+            "anchor": ([round(float(v), 1) for v in goal.anchor]
+                       if goal is not None and goal.anchor is not None else None),
+            "range": None if range_now is None else round(range_now, 1),
             "predicted_point": [round(v, 1) for v in self.predicted_point] if self.predicted_point else None,
         }
 

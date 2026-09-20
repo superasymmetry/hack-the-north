@@ -10,6 +10,7 @@ world and no X display.
 """
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -19,7 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mcagents.agents.rocket2 import Rocket2Agent, Rocket2Config
 from mcagents.cli.rocket2 import GoalLoop, PointResolver, is_halt, run_goal, turn_pieces
+from mcagents.gaze import GazeSample
 from mcagents.goals import GoalSpool, StatusChannel
+
+#: The voxel reach the stub reports, matching the session's own default.
+REACH = 7
 
 BINARY_KEYS = ["attack", "use", "inventory", "forward", "back", "left", "right", "sneak",
                "sprint", "jump", "drop"] + [f"hotbar.{i}" for i in range(1, 10)]
@@ -36,24 +41,43 @@ class StubSim:
     action_type = "env"
 
     def __init__(self):
-        from minestudio.simulator.callbacks import PrevActionCallback
+        from minestudio.simulator.callbacks import PrevActionCallback, VoxelsCallback
 
-        self.callbacks = [PrevActionCallback()]
+        self.callbacks = [PrevActionCallback(), VoxelsCallback([-REACH, REACH] * 3)]
         self.steps = 0
         self.logs = 0
         #: Called with the step number after each step -- how a test lands a goal mid-goal.
         self.on_step = None
         #: Whether the trunk is drawn; a test removes it to lose the lock.
         self.trunk = True
+        #: Where the player is, and the world's solid blocks by absolute (x, y, z) -- so
+        #: that moving the player moves the player, and not the scenery with them.
+        self.pos = {"x": 100.5, "y": 64.0, "z": 200.5, "yaw": 0.0, "pitch": 0.0}
+        self.blocks: Dict[Any, str] = {}
         self.actions = []
+        #: Every string action the sim was handed, i.e. every step a person drove.
+        self.handed_over = []
         self.obs, self.info = self._frame()
+
+    @property
+    def plays(self) -> bool:
+        return any(any(a.__name__ == "PlayCallback" for a in type(cb).__mro__)
+                   for cb in self.callbacks)
 
     def _frame(self):
         pov = np.zeros((360, 640, 3), np.uint8)
         if self.trunk:
             pov[120:260, 260:400] = (110, 70, 40)      # a "tree trunk" to point at
+        names = np.full((2 * REACH + 1,) * 3, "minecraft:air", dtype=object)
+        feet = np.floor([self.pos["x"], self.pos["y"], self.pos["z"]]).astype(int)
+        for coords, block in self.blocks.items():
+            index = np.array(coords) - feet + REACH
+            if np.all(index >= 0) and np.all(index < 2 * REACH + 1):
+                names[tuple(index)] = block
         info = {
             "pov": pov,
+            "player_pos": dict(self.pos),
+            "voxels": {"block_name": names},
             "inventory": {i: {"type": "none", "quantity": 0} for i in range(36)},
             "mine_block": {"minecraft.mine_block:minecraft.oak_log": np.array(float(self.logs))},
         }
@@ -74,6 +98,12 @@ class StubSim:
         return {**{k: np.array(0) for k in BINARY_KEYS}, "camera": np.zeros(2, np.float32)}
 
     def step(self, action):
+        if isinstance(action, str):
+            # What MineStudio's PlayCallback does with a string: read the keyboard and
+            # substitute whatever it finds. The stub has no keyboard, so it presses nothing.
+            assert self.plays, "a string action reached a sim with no PlayCallback"
+            self.handed_over.append(action)
+            action = self.noop_action()
         assert "camera" in action and "buttons" not in action, "expected an env-format action"
         self.actions.append(action)
         self.steps += 1
@@ -171,6 +201,57 @@ def check_idle_stepping(agent: Rocket2Agent) -> None:
     agent.drain()
 
 
+def check_human_stepping() -> None:
+    """--play hands the waiting steps to a person. Who is driving is decided by one thing:
+    what `sim.step()` was given -- a dict is the policy, the string is the keyboard."""
+    class Playing(StubSim):
+        def __init__(self):
+            super().__init__()
+            # A *subclass*, because that is what is really in the sim
+            # (mcagents.minecraft.play.PlayWindow). Matching the exact type instead of the
+            # hierarchy is a silent failure: the keyboard simply does nothing.
+            play_callback = type("PlayCallback", (), {})
+            self.callbacks.append(type("PlayWindow", (play_callback,), {})())
+
+    # Without a PlayCallback there is nothing that could read a keyboard, and saying so
+    # beats a shape error from inside MineStudio twenty minutes into a session.
+    plain = Rocket2Agent(StubSim(), Rocket2Config(max_steps=20, preview=False), verbose=False)
+    assert plain.plays is False
+    try:
+        plain.human_step()
+    except RuntimeError as error:
+        assert "PlayCallback" in str(error), error
+    else:
+        raise AssertionError("human_step ran on a sim with nothing to read the keyboard")
+
+    agent = Rocket2Agent(Playing(), Rocket2Config(max_steps=20, preview=False),
+                         masker=plain.masker, verbose=False)
+    assert agent.plays is True
+
+    before = agent.sim.steps
+    assert agent.human_step() is True
+    assert agent.sim.steps == before + 1, "human_step did not step the world"
+    assert agent.sim.handed_over == [Rocket2Agent.HUMAN_ACTION], agent.sim.handed_over
+
+    # A goal takes the controls: the policy's actions go through as dicts, and not one of
+    # them is handed to the keyboard.
+    agent.run(point=[330, 190], interaction="Mine", stop=4)
+    assert agent.sim.handed_over == [Rocket2Agent.HUMAN_ACTION], "a goal let go of the controls"
+
+    # ...and gives them back when it ends.
+    assert agent.human_step() is True
+    assert len(agent.sim.handed_over) == 2, agent.sim.handed_over
+
+    agent.set_goal(point=[330, 190], interaction="Mine", stop=5)
+    try:
+        agent.human_step()
+    except RuntimeError as error:
+        assert "call step()" in str(error), error
+    else:
+        raise AssertionError("human_step ran while a goal was busy")
+    agent.drain()
+
+
 def check_goals_off_the_wire(agent: Rocket2Agent) -> None:
     """A goal that arrived as JSON has to behave exactly like one out of a plan file --
     including the keys ROCKET-2's set_goal has never heard of."""
@@ -208,7 +289,9 @@ def check_arrival_and_lock(agent: Rocket2Agent) -> None:
     # does not fire, so a step budget still ends it -- and the lock holds on a still frame.
     result = agent.run(point=[330, 190], interaction="Approach", stop={"steps": 12})
     assert result.reason == "steps" and result.steps == 12, result
-    assert agent.goal.stop == {"steps": 12, "arrive": {"width": 0.6}}, agent.goal.stop
+    assert agent.goal.stop == {"steps": 12, "arrive": {"width": 0.6, "distance": 3.0}}, \
+        agent.goal.stop
+    assert agent.goal.anchor is None, "nothing solid is in front of the stub to anchor to"
     assert agent.goal.lock is not None and agent.goal.lock.updates >= 3, "lock never confirmed"
     box = agent.goal_box()
     assert abs((box[2] - box[0]) - 140 / 640) < 0.02, box
@@ -246,6 +329,7 @@ def check_arrival_and_lock(agent: Rocket2Agent) -> None:
     assert not result.success
 
     for bad, expected in [({"arrive": {"width": 1.5}}, "fraction"),
+                          ({"arrive": {"distance": 0}}, "positive number of blocks"),
                           ({"arrive": {"depth": 3}}, "unknown arrive keys")]:
         try:
             agent.set_goal(point=[330, 190], interaction="Approach", stop=bad)
@@ -254,6 +338,57 @@ def check_arrival_and_lock(agent: Rocket2Agent) -> None:
         else:
             raise AssertionError(f"accepted {bad}")
     assert not agent.busy
+
+
+def check_arrival_by_distance(agent: Rocket2Agent) -> None:
+    """Where the target has a world position, that is what arrival means -- not pixel width.
+
+    The trunk fills 0.22 of the frame throughout, so every arrival here is the distance
+    talking: the width test would never fire, and it is the one that a spin could fool.
+    """
+    sim = agent.sim
+    sim.blocks = {(100, 65, 205): "minecraft:oak_log"}   # five blocks due +z, at eye height
+    agent.idle_step()                                   # re-render: voxels come with a frame
+    try:
+        agent.set_goal(point=[330, 190], interaction="Approach", stop={"steps": 4})
+        assert agent.goal.anchor is not None, "a block in plain view went un-anchored"
+        assert np.allclose(agent.goal.anchor, [100.5, 65.5, 205.5]), agent.goal.anchor
+        assert abs(agent.range_to_goal() - 5.0) < 0.01, agent.range_to_goal()
+        assert agent.status()["range"] == 5.0, agent.status()
+        agent.drain()
+
+        # Turning right round leaves the anchor exactly where it was. A test that read the
+        # frame would now be looking at empty sky.
+        sim.pos["yaw"] = 180.0
+        assert abs(agent.range_to_goal() - 5.0) < 0.01, "the target moved when the agent turned"
+
+        # Walk to within the arrival distance and the next goal is over before it starts.
+        sim.pos.update({"yaw": 0.0, "z": 203.0})
+        agent.idle_step()
+        result = agent.run(point=[330, 190], interaction="Approach", stop={"steps": 50})
+        assert result.reason == "arrived" and result.steps == 0, result
+
+        # Out of voxel range there is nothing to anchor to, and width takes over again.
+        sim.pos.update({"yaw": 0.0, "z": 190.5})
+        agent.idle_step()
+        agent.set_goal(point=[330, 190], interaction="Approach", stop={"steps": 3})
+        assert agent.goal.anchor is None, agent.goal.anchor
+        assert agent.run().reason == "steps"
+
+        # Walking into range anchors it mid-goal, without re-pointing.
+        agent.set_goal(point=[330, 190], interaction="Approach", stop={"steps": 6})
+        sim.on_step = lambda step: sim.pos.update({"z": 200.5})
+        try:
+            result = agent.run()
+        finally:
+            sim.on_step = None
+        assert agent.goal.anchor is not None, "the target never anchored on the way in"
+        assert result.reason == "steps", result
+    finally:
+        sim.on_step = None
+        sim.blocks, sim.pos = {}, {"x": 100.5, "y": 64.0, "z": 200.5, "yaw": 0.0, "pitch": 0.0}
+        agent.cancel("cleanup")
+        agent.idle_step()
 
 
 def check_goals_arriving_mid_goal(agent: Rocket2Agent) -> None:
@@ -429,6 +564,130 @@ def check_turns_in_place(agent: Rocket2Agent) -> None:
             [("started", None), ("rejected", "invalid"), ("ended", "steps")]
 
 
+def check_gaze_goals(agent: Rocket2Agent) -> None:
+    """The whole point of the gaze path: "mine that" runs against what you are looking at.
+
+    A goal with no point and no instruction used to be refused. Now it adopts the committed
+    selection -- and adopts the *mask*, so it costs no second SAM-2 call and aims at exactly
+    what was outlined rather than at whatever re-segmenting a later frame would have found.
+    """
+    from mcagents.perception.selection import GazeSelector, ScreenMap, SelectorConfig
+
+    rect = (0, 0, 1280, 720)                      # a window, so screen->frame is 2x by 2x
+
+    class Eyes:
+        at = None
+
+        def sample(self):
+            if self.at is None:
+                return None
+            return GazeSample(x=self.at[0] * 2, y=self.at[1] * 2, t=time.time())
+
+    eyes = Eyes()
+    selector = GazeSelector(agent.masker, ScreenMap(lambda: rect), eyes,
+                            # release_ms=0 so letting go is immediate and this test does not
+                            # have to sleep out the tracker-dropout grace to observe the hold.
+                            SelectorConfig(lock_ms=0, deadzone=0.0, smoothing=1.0,
+                                           release_ms=0.0),
+                            report=lambda message: None)
+    calls = []
+    agent.masker.mask = lambda *a, original=agent.masker.mask, **k: (
+        calls.append(1), original(*a, **k))[1]
+    agent.selector = selector
+    hold_ms = agent.config.selection_hold_ms
+    try:
+        with tempfile.TemporaryDirectory() as goals, tempfile.TemporaryDirectory() as out:
+            status = StatusChannel(out)
+            loop = GoalLoop(agent, PointResolver(), GoalSpool(goals), status)
+
+            def statuses():
+                found = []
+                while (message := status.spool.take()) is not None:
+                    found.append((message["event"], message["reason"]))
+                return found
+
+            # Nothing is selected yet, so a goal naming no target is still refused -- it must
+            # not fall through to "approach something, anything".
+            assert loop.locked_selection() is None
+            before = agent.sim.steps
+            assert loop.run({"interaction": "Mine", "stop": 5}, "t") is True
+            assert not agent.busy and agent.sim.steps == before
+
+            # Look at the trunk. The selector needs a step to hand its encoder a frame and a
+            # moment for the encoder to finish.
+            eyes.at = (330, 190)
+            for _ in range(20):
+                agent.idle_step()
+                if selector.selection is not None and selector.selection.locked:
+                    break
+                time.sleep(0.02)
+            selection = loop.locked_selection()
+            assert selection is not None, "looking straight at the trunk selected nothing"
+            assert 15_000 < selection.area < 25_000, selection.area
+            x0, y0, x1, y1 = selection.box
+            assert (x0, y0, x1, y1) == (260, 120, 400, 260), selection.box
+
+            # Now the goal that names nothing at all runs against it, for free.
+            calls.clear()
+            assert loop.run({"interaction": "Mine", "stop": 5}, "t") is True
+            assert agent.result.reason == "steps" and agent.result.steps == 5, agent.result
+            assert calls == [], f"the gaze goal re-segmented anyway ({len(calls)} SAM-2 calls)"
+            assert np.array_equal(agent.goal.mask, selection.mask), \
+                "the goal is not the object that was outlined"
+            assert agent.goal.interaction == "Mine"
+
+            # An explicit point still wins: a planner that knows where it wants to go is not
+            # overruled by where somebody happens to be looking.
+            calls.clear()
+            assert loop.run({"point": [330, 190], "interaction": "Mine", "stop": 2}, "t")
+            assert len(calls) == 1, "an explicit point did not segment its own mask"
+
+            # Let go, the way a hand opens the moment the person starts talking. The live
+            # selection is gone within a step or two...
+            statuses()
+            eyes.at = None
+            for _ in range(5):
+                agent.idle_step()
+                if agent.selection is None:
+                    break
+            assert agent.selection is None, "letting go did not drop the live selection"
+
+            # ...and the goal that comes back seconds later still runs against it, on the same
+            # mask, because that is the only way a *spoken* pointed task can work at all.
+            calls.clear()
+            held = loop.locked_selection()
+            assert held is not None, "the selection was not held past the pointing"
+            assert agent.held_age() is not None and agent.held_age() < hold_ms / 1000.0
+            assert loop.run({"interaction": "Mine", "stop": 3}, "t") is True
+            assert agent.result.reason == "steps" and agent.result.steps == 3, agent.result
+            assert calls == [], f"the held goal re-segmented ({len(calls)} SAM-2 calls)"
+            assert np.array_equal(agent.goal.mask, selection.mask), \
+                "the held goal is not the object that was outlined"
+
+            # What the model is told about it, in the frame it is looking at: the same box,
+            # flagged as pointing that has already stopped rather than as a live one.
+            payload = agent.selection_payload()
+            assert payload["held"] is True and payload["age"] > 0, payload
+            assert payload["box"] == [round(v, 4) for v in held.normalized_box()], payload
+
+            # Past the window it is gone, and a goal naming no point is refused rather than
+            # run against pointing nobody remembers doing.
+            agent.config.selection_hold_ms = 0.0
+            assert agent.held_selection() is None and loop.locked_selection() is None
+            assert agent.selection_payload() is None
+            statuses()
+            before = agent.sim.steps
+            assert loop.run({"interaction": "Mine", "stop": 3}, "t") is True
+            assert agent.sim.steps == before, "a goal with nothing to aim at moved anyway"
+            assert statuses() == [("rejected", "no_target")]
+    finally:
+        del agent.masker.mask
+        agent.selector = None
+        agent.config.selection_hold_ms = hold_ms
+        agent._held = None
+        selector.close()
+
+
 def check_cfg_path(masker) -> None:
     """Classifier-free guidance takes a different forward path; it must still produce actions."""
     agent = Rocket2Agent(StubSim(), Rocket2Config(cfg_coef=1.0, max_steps=20),
@@ -443,10 +702,13 @@ def main() -> int:
     check_streaming_api(agent)
     check_guardrails(agent)
     check_idle_stepping(agent)
+    check_human_stepping()
     check_goals_off_the_wire(agent)
     check_arrival_and_lock(agent)
+    check_arrival_by_distance(agent)
     check_goals_arriving_mid_goal(agent)
     check_turns_in_place(agent)
+    check_gaze_goals(agent)
     check_cfg_path(agent.masker)
     print("\nALL API TESTS PASSED")
     return 0

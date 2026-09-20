@@ -19,8 +19,8 @@ from mcagents.minecraft.world import DEFAULT_BIOME, DEFAULT_WORLD, WorldCache, b
 
 
 def default_world() -> Path:
-    """Chiang Tung when it has been put in worlds/, the plains cache otherwise."""
-    return DEFAULT_WORLD if DEFAULT_WORLD.exists() else WorldCache().path
+    """The plains cache from `scripts/build_world.sh`."""
+    return DEFAULT_WORLD
 
 
 @dataclass
@@ -36,6 +36,11 @@ class EnvConfig:
     city: bool = False
     #: Whether `world` was named by the caller. An explicit choice is never second-guessed.
     explicit_world: bool = False
+    #: Blocks either side of the player to report in `info['voxels']`, which is what lets a
+    #: controller turn a pointed pixel into a world position (mcagents/minecraft/ranging.py).
+    #: Every step pays for it, and the cost grows as the cube, so this stays small: 7 is
+    #: about the range an Approach needs to know it has got there. 0 turns it off.
+    voxels: int = 7
 
     @classmethod
     def from_env(cls, city_default: bool = False) -> "EnvConfig":
@@ -45,6 +50,7 @@ class EnvConfig:
             world=Path(world) if world else default_world(),
             city=os.environ.get("CITY", "1" if city_default else "0") != "0",
             explicit_world=bool(world),
+            voxels=int(os.environ.get("MC_VOXELS", cls.voxels)),
         )
 
 
@@ -103,6 +109,10 @@ class Session(AbstractContextManager):
         PrevActionCallback seeded before it stale.
         """
         callbacks = list(extra)
+        if self.config.voxels > 0:
+            from minestudio.simulator.callbacks import VoxelsCallback
+            reach = self.config.voxels
+            callbacks.append(VoxelsCallback([-reach, reach] * 3))
         if self.config.city:
             from mcagents.minecraft.city import CityCallback
             callbacks.insert(0, CityCallback())

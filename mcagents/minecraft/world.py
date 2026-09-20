@@ -43,9 +43,9 @@ BAKED_SUFFIX = "city"
 #: Worlds that are already a city, by name, though not baked by us: imported maps.
 CITY_WORLDS = frozenset({"chiangtung"})
 
-#: The world a run loads when MC_WORLD does not name one. The Kingdom of Chiang Tung map,
-#: packed by `WorldCache.pack()`; runs fall back to the plains cache while it is missing.
-DEFAULT_WORLD = WORLDS_DIR / "chiangtung.zip"
+#: The world a run loads when MC_WORLD does not name one: the plains cache written by
+#: `scripts/build_world.sh`. Runs generate a world the slow way while it is missing.
+DEFAULT_WORLD = WORLDS_DIR / "plains.zip"
 
 
 def terrain_biome(name: str) -> str:

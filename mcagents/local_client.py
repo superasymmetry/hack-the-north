@@ -42,6 +42,17 @@ more than the model's entire turn. Two kinds of message go up it:
     {"text": "mine the diamond ore", "final": true}
     {"kind": "frame", "image": "<base64 jpeg>"}
 
+...and either can carry what is being pointed at, which is the other half of "mine *that*":
+
+    {"text": "mine that", "final": true,
+     "selection": {"point": [0.51, 0.42], "box": [...], "locked": true, "held": true,
+                   "age": 1.4}}
+
+The point comes from whoever has the pixels -- `--hand` or `--gaze` in the ROCKET-2 process --
+through the same sidecar the frames come through. On the utterance as well as on the frame,
+because a frame is up to `frame_interval` old and arrives as its own message: stamped onto the
+final, the phrase and the coordinate of *that* are one thing to reason about. See `Outbox`.
+
 Partials go as `final: false` -- the server ignores them today, and they are what
 endpointing and barge-in will hang off tomorrow -- but partials and finals are not worth the
 same thing, which is the one idea in `Outbox`: a partial is worthless a moment later and
@@ -119,7 +130,8 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidSta
 if __package__ in (None, ""):
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mcagents.frames import DEFAULT_PATH as DEFAULT_FRAME_PATH, read_latest
+from mcagents.frames import (DEFAULT_PATH as DEFAULT_FRAME_PATH, read_latest,
+                             read_selection)
 from mcagents.goals import (DEFAULT_DIR as DEFAULT_GOAL_DIR, DEFAULT_STATUS_DIR, TURN_KEY,
                             GoalSpool, parse_turn)
 from mcagents.voice import (LiveLine, Listener, VoiceConfig, input_devices, input_level,
@@ -309,9 +321,17 @@ class Utterance:
     asr_ms: Optional[float] = None
     #: Raw timing components, kept only for --timing.
     debug: Optional[dict] = None
+    #: What was being pointed at as this phrase ended -- the same dict the frames carry.
+    #: Frames already carry it, but a frame is up to `frame_interval` old and the model has
+    #: to *correlate* it with the words; stamped onto the utterance instead, "mine that"
+    #: arrives with the coordinate of `that` in the same message. See `Outbox.selection_of`.
+    selection: Optional[dict] = None
 
     def payload(self) -> dict:
-        return {"text": self.text, "final": self.final}
+        body = {"text": self.text, "final": self.final}
+        if self.selection is not None:
+            body["selection"] = self.selection
+        return body
 
 
 @dataclass
@@ -331,11 +351,20 @@ class Frame:
     jpeg: bytes
     #: The publisher's mtime, so the reader can tell a new frame from the same one again.
     mtime: float = 0.0
+    #: What was highlighted in *this* frame -- the centre of the red box and the box itself,
+    #: as fractions of it -- or None when nothing was. Published alongside the JPEG by
+    #: whoever had the pixels, because coordinates only mean something against a picture.
+    #: It is what lets the model answer "mine that" with an interaction and a sentence
+    #: instead of having to work out which tree "that" was.
+    selection: Optional[dict] = None
     queued_at: float = field(default_factory=time.monotonic)
     final: bool = False
 
     def payload(self) -> dict:
-        return {"kind": "frame", "image": base64.b64encode(self.jpeg).decode("ascii")}
+        body = {"kind": "frame", "image": base64.b64encode(self.jpeg).decode("ascii")}
+        if self.selection is not None:
+            body["selection"] = self.selection
+        return body
 
 
 #: What travels through the Outbox and out of the socket. The two share `final`,
@@ -444,6 +473,22 @@ def parse_turn_command(raw) -> Optional[Dict[str, Any]]:
     return None
 
 
+def describe_selection(selection: Optional[dict]) -> str:
+    """` [pointing at 0.51, 0.42]` for the terminal, or nothing when nothing was pointed at.
+
+    Worth a few characters on the line that is already printed for every final: whether the
+    coordinate rode along with the words is the one thing that decides if "mine that" can be
+    answered at all, and without it the failure is a silent one on the far side of a tunnel.
+    """
+    if not isinstance(selection, dict):
+        return ""
+    point = selection.get("point")
+    if not (isinstance(point, (list, tuple)) and len(point) == 2):
+        return " [pointing]"
+    held = " held" if selection.get("held") else ""
+    return f" [pointing at {point[0]:.2f}, {point[1]:.2f}{held}]"
+
+
 def describe_goal(entry: Dict[str, Any]) -> str:
     """One line naming a goal, for the terminal the person is watching."""
     if entry.get("cancel") is True:
@@ -477,7 +522,13 @@ class Outbox:
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop, max_final_age: float = 30.0,
-                 max_finals: int = 32):
+                 max_finals: int = 32, selection_of=None):
+        #: Called for every final, to stamp it with what was being pointed at as it ended.
+        #: Here rather than at each of the two places a final is made (the microphone and
+        #: --text) because this is already the one place that knows a final from a partial --
+        #: and it runs at *queue* time, so the coordinate is the one from when the phrase
+        #: ended and not the one from whenever the socket got around to sending it.
+        self.selection_of = selection_of
         self._loop = loop
         self._finals: "collections.deque[Utterance]" = collections.deque(maxlen=max_finals)
         self._partial: Optional[Utterance] = None
@@ -494,6 +545,8 @@ class Outbox:
         if isinstance(message, Frame):
             self._frame = message
         elif message.final:
+            if message.selection is None and self.selection_of is not None:
+                message.selection = self.selection_of()
             self._finals.append(message)
         else:
             self._partial = message
@@ -981,7 +1034,12 @@ async def frame_pump(config: ClientConfig, outbox: Outbox, report,
             jpeg, mtime = latest
             if mtime > last_mtime:
                 last_mtime = mtime
-                outbox.put(Frame(jpeg=jpeg, mtime=mtime))
+                # Read after the frame, never before: the publisher writes the JPEG and then
+                # the sidecar, so reading in that order cannot pair new coordinates with an
+                # old picture. The worst case is the reverse -- a selection one frame stale,
+                # which is a box slightly behind rather than a box on the wrong object.
+                selection = read_selection(config.frame_path, config.frame_max_age)
+                outbox.put(Frame(jpeg=jpeg, mtime=mtime, selection=selection))
                 if not live:
                     report(f"frames: {config.frame_path} is live, sending one every "
                            f"{config.frame_interval:g}s ({len(jpeg) / 1024:.1f} KB)")
@@ -1494,7 +1552,8 @@ def make_on_sent(config: ClientConfig, live: Optional[LiveLine], stats: dict):
             parts.append(f"queued->sent {(now - utterance.queued_at) * 1000:.0f} ms")
         if utterance.debug:
             parts.append(" ".join(f"{k}={v:.3f}" for k, v in utterance.debug.items()))
-        emit(f"  sent: {utterance.text}   ({' . '.join(parts)})")
+        emit(f"  sent: {utterance.text}{describe_selection(utterance.selection)}   "
+             f"({' . '.join(parts)})")
 
     def emit(line: str) -> None:
         if live is None:
@@ -1509,7 +1568,10 @@ def make_on_sent(config: ClientConfig, live: Optional[LiveLine], stats: dict):
 async def run(config: ClientConfig, use_text: bool) -> int:
     loop = asyncio.get_running_loop()
     live = LiveLine() if (config.partial and not use_text) else None
-    outbox = Outbox(loop, config.max_final_age, config.max_finals)
+    outbox = Outbox(loop, config.max_final_age, config.max_finals,
+                    selection_of=(lambda: read_selection(config.frame_path,
+                                                         config.frame_max_age))
+                    if config.frames else None)
     report = make_reporter(live)
     stats = {"frames": 0, "replies": 0, "goals": 0}
     on_sent = make_on_sent(config, live, stats)

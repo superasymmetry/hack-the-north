@@ -4,10 +4,24 @@ SAM-2 comes from transformers rather than Meta's `sam2` package or the realtime 
 MineStudio's PlaySegmentCallback wants: transformers is already in this env, and the
 video/tracking predictors those provide would be wasted here. ROCKET-2 does its own
 tracking, so all that is ever needed is one mask on one frame per goal.
+
+Following a *gaze* is the exception: there the point moves many times a second over a frame
+that is barely changing, and one mask call per sample is nowhere near fast enough. So the
+call is also available split in two -- `embed()` runs the image encoder, `mask_at()` runs
+only the prompt decoder against a cached embedding. Measured on this laptop's GPU at 640x360,
+fp32:
+
+    mask()                 113 ms      encode + decode, one point
+    embed()                 84 ms      the encoder, which is nearly all of it
+    mask_at()                4 ms      per point, against an embedding already computed
+
+That is what makes a box that follows your eyes possible at all. See
+mcagents/perception/selection.py, which owns the policy of when to re-encode.
 """
 import os
-from dataclasses import dataclass
-from typing import Optional, Protocol, Sequence
+import time
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Protocol, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -34,6 +48,35 @@ class SamConfig:
             model_id=os.environ.get("MCAGENTS_SAM_MODEL", cls.model_id),
             device=os.environ.get("MCAGENTS_DEVICE", cls.device),
         )
+
+
+@dataclass
+class Embedding:
+    """Everything SAM-2 learned about one frame -- all `mask_at` needs except the point.
+
+    `shape` and `target` are kept because the processor's own point rescaling happens on the
+    way in with the image, and a decode that skips the image has to redo it: the encoder sees
+    a square `target` (1024x1024), so a point in a 640x360 frame is scaled by width and height
+    *independently*. Getting that wrong does not fail, it quietly segments somewhere else.
+    """
+    features: List[Any]
+    sizes: Any
+    #: (height, width) of the frame this was computed from.
+    shape: Tuple[int, int]
+    #: (height, width) the encoder actually saw.
+    target: Tuple[int, int]
+    #: `time.monotonic()` when it was computed, so a caller can tell how stale it is.
+    t: float = field(default_factory=time.monotonic)
+
+    @property
+    def age(self) -> float:
+        return time.monotonic() - self.t
+
+    def to_encoder(self, point: Sequence[float]) -> Tuple[float, float]:
+        """`point` in frame pixels, as the coordinates the encoder's grid is indexed by."""
+        height, width = self.shape
+        rows, columns = self.target
+        return float(point[0]) * columns / width, float(point[1]) * rows / height
 
 
 class PointMasker:
@@ -79,6 +122,40 @@ class PointMasker:
             outputs = self.model(**inputs, multimask_output=False)
         masks = self.processor.post_process_masks(outputs.pred_masks.float(),
                                                   inputs["original_sizes"])
+        return masks[0][0].squeeze().cpu().numpy().astype(bool)
+
+    # ------------------------------------------------------------------ the split path
+
+    def embed(self, frame: np.ndarray) -> Embedding:
+        """Run the image encoder over `frame` and keep the result. ~84 ms.
+
+        The expensive half of `mask()`, done once so that any number of points can be asked
+        about the same frame for ~4 ms each.
+        """
+        frame = np.ascontiguousarray(frame)
+        inputs = self.processor(images=frame, return_tensors="pt").to(self.config.device)
+        with torch.inference_mode():
+            features = self.model.get_image_embeddings(inputs["pixel_values"])
+        return Embedding(
+            features=features,
+            sizes=inputs["original_sizes"],
+            shape=frame.shape[:2],
+            target=tuple(inputs["pixel_values"].shape[-2:]),
+        )
+
+    def mask_at(self, embedding: Embedding, point: Sequence[float]) -> np.ndarray:
+        """Segment the object at `point` ([x, y] pixels) in the frame `embedding` came from. ~4 ms.
+
+        Identical to `mask()` on the same frame and point -- the only thing skipped is
+        recomputing what the image looks like, which is the thing that did not change.
+        """
+        x, y = embedding.to_encoder(point)
+        points = torch.tensor([[[[x, y]]]], dtype=torch.float32, device=self.config.device)
+        labels = torch.tensor([[[1]]], dtype=torch.int32, device=self.config.device)
+        with torch.inference_mode():
+            outputs = self.model(image_embeddings=embedding.features, input_points=points,
+                                 input_labels=labels, multimask_output=False)
+        masks = self.processor.post_process_masks(outputs.pred_masks.float(), embedding.sizes)
         return masks[0][0].squeeze().cpu().numpy().astype(bool)
 
 

@@ -413,7 +413,7 @@ bash scripts/build_world.sh   # once — the slow generation, writes worlds/plai
 bash scripts/rocket2.sh       # picks it up automatically from then on
 ```
 
-`EnvConfig` reads `MC_WORLD` (default `worlds/chiangtung.zip`, or `worlds/plains.zip` while that is absent); if the file is missing the runner
+`EnvConfig` reads `MC_WORLD` (default `worlds/plains.zip`); if the file is missing the runner
 says so and generates a world as before. Measured against the same
 attached instance: **22.7 s → 9.0 s**, and in the Minecraft log mission-init → `joined the
 game` goes 21 s → 6 s.

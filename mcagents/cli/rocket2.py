@@ -29,6 +29,11 @@ game view under logs/rocket2. --no-preview (or ROCKET2_PREVIEW=0) drops the wind
 drops itself when there is no display to open it on; --no-record drops the mp4. Between them
 a headless run still leaves something to watch afterwards.
 
+--hand is the whole pointing path in one flag: it starts the hand tracker (in its own
+virtualenv, .gaze-env), waits for it to publish, then opens the game with whatever you pinch at
+outlined in red. A goal that arrives naming no point runs against that outline, which is what
+lets "mine that" work -- see docs/rocket2.md. The tracker is stopped when the run ends.
+
 With --city the world is the one from mcagents.minecraft.city -- streets, buildings, a park
 and a fountain plaza -- because a pointing agent needs somewhere to point. It costs ~20s of
 every reset and cannot be cached.
@@ -38,6 +43,8 @@ import collections
 import json
 import math
 import os
+import signal
+import subprocess
 import time
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
@@ -70,6 +77,11 @@ DEFAULT_GOAL_STOP: Any = {"steps": 300}
 #: inside the client's 1s/3s cadence; the world runs at a quarter of Minecraft's 20 Hz
 #: while nothing is asked of it, which nothing is looking closely enough to notice.
 DEFAULT_IDLE_HZ = 5.0
+
+#: How long to wait for a tracker this run started to publish its first point. Long enough
+#: for mediapipe to load and a webcam to wake up; short enough that a camera which is not
+#: there does not hold the run up on the way to Minecraft.
+TRACKER_WAIT = 20.0
 
 #: Most degrees of yaw per step of an in-place turn. The sim would take 180 in one step (it
 #: turns exactly what it is told), but the frames going up would show a jump cut rather than
@@ -284,6 +296,39 @@ class GoalLoop:
             self.emit("rejected", reason, entry)
         self.pending.clear()
 
+    def locked_selection(self):
+        """What the person pointed at, if they pointed at it long enough to mean it.
+
+        A *committed* lock only -- a hover is the box passing over something on the way
+        somewhere else, and a goal is not a thing to start on a glance. `fresh` is checked
+        too: a box the selector has already flagged as drawn from a view that has since
+        turned is not one to aim a policy at.
+
+        And a lock that has since been let go still counts, for as long as the agent holds it
+        (`Rocket2Config.selection_hold_ms`). This is the difference between a pointed task
+        working and not: the pinch is released, or the eyes move, seconds before a goal can
+        come back down the tunnel -- so requiring a *live* lock here means every spoken "mine
+        that" arrives to find nothing selected.
+        """
+        selection = getattr(self.agent, "selection", None)
+        if selection is not None and selection.locked and selection.fresh:
+            return selection
+        held = getattr(self.agent, "held_selection", None)
+        return held() if held is not None else None
+
+    def _how_old(self, selection) -> str:
+        """` (held 1.4s)` when the goal is running against pointing that has already stopped.
+
+        Worth a word in the terminal rather than nothing: a goal aimed at the wrong object is
+        the one failure of this path, and "it used the box from a second and a half ago" is
+        the first thing to want to know about it.
+        """
+        live = getattr(self.agent, "selection", None)
+        if live is selection:
+            return ""
+        age = getattr(self.agent, "held_age", lambda: None)()
+        return f" (held {age:.1f}s)" if age is not None else " (held)"
+
     def _same_goal(self, entry: Dict[str, Any], interaction: str, goal_id: Any) -> bool:
         if _interaction(entry) != interaction.lower():
             return False
@@ -313,43 +358,69 @@ class GoalLoop:
 
         entry = dict(entry)
         spec = entry.pop("point", None)
-        if spec is None:
+        # A goal with no coordinates is the one the pointing path produces: the planner heard
+        # "mine that", and *that* is whatever is boxed on the screen -- now, or a couple of
+        # seconds ago, which is the same thing to somebody who has just said it. Preferring
+        # the lock over the instruction is the whole bargain: the person already pointed, with
+        # a hand or their eyes, so nothing has to re-derive which object they meant from
+        # words.
+        selection = self.locked_selection() if spec is None else None
+        if spec is None and selection is None:
             # ROCKET-2's goal channel is a point, not a sentence. A planner that sent an
             # instruction still said what it wants looked at, so hand the words to the
             # targeter rather than refusing a goal that is nearly right.
             spec = entry.pop("instruction", None)
             if spec is not None:
                 print(f"[{label}] no point given; targeting the instruction {spec!r}", flush=True)
-        entry.pop("instruction", None)
-        if spec is None:
-            print(f"[{label}] skipped -- the goal names no point and no instruction", flush=True)
+        instruction = entry.pop("instruction", None)
+        if spec is None and selection is None:
+            print(f"[{label}] skipped -- the goal names no point and no instruction, and "
+                  f"nothing is selected", flush=True)
             self.emit("rejected", "no_target", entry)
             return True
 
-        try:
-            point = self.resolver.resolve(agent, spec)
-        except LookupError as unpointable:
-            # One goal with no target in frame is not a reason to tear the world down: the next
-            # goal may well have one, and the window and the mp4 keep going.
-            print(f"[{label}] skipped -- {unpointable}", flush=True)
-            self.emit("rejected", "not_found", entry)
-            return True
-        except Exception as broken:
-            # A VLM that is down raises a requests error, not a LookupError, and that used
-            # to end the whole rocket2 process from inside a listener meant to outlive it.
-            print(f"[{label}] skipped -- the targeter failed: {type(broken).__name__}: {broken}",
-                  flush=True)
-            self.emit("rejected", "targeter_error", entry)
-            return True
+        if selection is None:
+            try:
+                point = self.resolver.resolve(agent, spec)
+            except LookupError as unpointable:
+                # One goal with no target in frame is not a reason to tear the world down: the next
+                # goal may well have one, and the window and the mp4 keep going.
+                print(f"[{label}] skipped -- {unpointable}", flush=True)
+                self.emit("rejected", "not_found", entry)
+                return True
+            except Exception as broken:
+                # A VLM that is down raises a requests error, not a LookupError, and that used
+                # to end the whole rocket2 process from inside a listener meant to outlive it.
+                print(f"[{label}] skipped -- the targeter failed: {type(broken).__name__}: "
+                      f"{broken}", flush=True)
+                self.emit("rejected", "targeter_error", entry)
+                return True
+        else:
+            point = selection.point
 
         fields = {key: entry[key] for key in SET_GOAL_KEYS if key in entry}
         ignored = sorted(set(entry) - set(fields) - set(LOOP_KEYS))
         if ignored:
             print(f"[{label}] ignoring unknown goal key(s): {', '.join(ignored)}", flush=True)
 
-        print(f"\n[{label}] {fields.get('interaction', 'Approach')} at {point}", flush=True)
+        interaction = fields.get("interaction", "Approach")
+        where = (f"the object you are pointing at ({point[0]:.0f}, {point[1]:.0f})"
+                 f"{self._how_old(selection)}"
+                 if selection is not None else f"at {point}")
+        print(f"\n[{label}] {interaction} {where}", flush=True)
+        if selection is not None and instruction:
+            print(f"[{label}] ({instruction!r} came with it; the selection is what is used)",
+                  flush=True)
         try:
-            agent.set_goal(point=point, **fields)
+            if selection is not None:
+                # No SAM-2 call: the mask behind the red box *is* the goal, so this starts in
+                # about no time and aims at exactly what was highlighted rather than at
+                # whatever a second segmentation of a later frame would have found.
+                agent.set_goal_from(selection, interaction=interaction,
+                                    stop=fields.get("stop"),
+                                    keep_memory=bool(fields.get("keep_memory", False)))
+            else:
+                agent.set_goal(point=point, **fields)
         except (ValueError, TypeError) as unusable:
             print(f"[{label}] skipped -- {unusable}", flush=True)
             self.emit("rejected", "invalid", entry, detail=str(unusable))
@@ -508,6 +579,11 @@ def listen(agent: Rocket2Agent, resolver: "PointResolver", spool: GoalSpool,
     Goals queued before this process existed are discarded on the way in. They were said to
     a different session, about a world that no longer exists -- the spawn has moved, the
     inventory is empty again -- and running them would be the most confusing possible start.
+
+    With a PlayCallback in the sim (`--play`), those waiting steps are handed to the *person*
+    instead of being no-ops: you play, and a goal takes the controls off you for as long as it
+    runs. `idle_hz` is then ignored, because PlayCallback already paces itself at its own
+    MINERL_FPS and a keyboard sampled five times a second is not a keyboard anyone can use.
     """
     stale = spool.clear()
     if status is not None:
@@ -519,17 +595,22 @@ def listen(agent: Rocket2Agent, resolver: "PointResolver", spool: GoalSpool,
         loop.emit("rejected", reason)
 
     spool.on_drop = dropped
+    # Who holds the keyboard between goals is a property of the sim, not a flag to pass down
+    # and keep in sync: either there is a callback that can read one, or there is not.
+    playing = agent.plays
+    waiting = agent.human_step if playing else agent.idle_step
     print(f"[listen] waiting for goals in {spool.directory}"
           f"{f' ({stale} from an earlier session discarded)' if stale else ''}\n"
-          f"[listen] talk to it with: ./scripts/local_client.sh", flush=True)
+          f"[listen] {'the game is yours until a goal arrives' if playing else 'idling'}; "
+          f"talk to it with: ./scripts/local_client.sh", flush=True)
 
-    period = 1.0 / idle_hz if idle_hz > 0 else 0.0
+    period = 0.0 if playing else (1.0 / idle_hz if idle_hz > 0 else 0.0)
     goals = 0
     while True:
         entry = loop.next()
         if entry is None:
             started = time.monotonic()
-            if not agent.idle_step():
+            if not waiting():
                 print("[listen] episode ended (death or reset) -- stopping here.")
                 return
             time.sleep(max(0.0, period - (time.monotonic() - started)))
@@ -537,6 +618,112 @@ def listen(agent: Rocket2Agent, resolver: "PointResolver", spool: GoalSpool,
         goals += 1
         if not loop.run(entry, f"listen {goals}"):
             return
+
+
+#: Where the tracker's own virtualenv lives. It needs numpy 2, opencv 5 and mediapipe, and
+#: the environment that runs Minecraft has numpy 1.26 and opencv 4.8 -- they must not meet, so
+#: the tracker is a separate *process* rather than a thread, and this is its interpreter.
+TRACKER_ENV = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), ".gaze-env")
+
+
+def tracker_running(path: Optional[str] = None) -> bool:
+    """Whether something is already publishing points -- a `./scripts/hand.sh` next door."""
+    from mcagents import gaze
+
+    return gaze.read_latest(path or gaze.DEFAULT_PATH, allow_invalid=True) is not None
+
+
+def start_tracker(kind: str, camera: int = 0) -> Optional[subprocess.Popen]:
+    """Start the hand (or gaze) tracker as a child of this run, and return it.
+
+    A separate terminal for it was one terminal too many: the tracker is not a thing you
+    reason about separately from the run, it is where the run's pointing comes from, and every
+    session began by starting two processes in a fixed order. So `--hand` starts its own.
+
+    None when one is already publishing -- a tracker started by hand keeps its own window and
+    its own `--check` output, and a second one fighting it for the camera would open, fail to
+    grab the device and take the run's own startup down with it.
+
+    It is started *before* Minecraft on purpose: mediapipe takes a few seconds to load and the
+    sim takes ~a minute, so doing it in this order costs nothing at all.
+    """
+    if tracker_running():
+        print(f"[{kind}] a tracker is already publishing -- using it", flush=True)
+        return None
+    python = os.path.join(TRACKER_ENV, "bin", "python")
+    if not os.access(python, os.X_OK):
+        raise SystemExit(f"no tracker environment at {TRACKER_ENV} -- create it with:\n"
+                         f"    bash scripts/setup/install_gaze.sh\n"
+                         f"or start the tracker yourself and pass --no-tracker.")
+    module = "mcagents.cli.hand" if kind == "hand" else "mcagents.cli.gaze"
+    command = [python, "-m", module]
+    if kind == "hand":
+        command += ["--camera", str(camera)]
+    environment = dict(os.environ)
+    root = os.path.dirname(TRACKER_ENV)
+    # The repo itself, so the child can import mcagents.gaze -- stdlib only, and the single
+    # module the two environments share.
+    environment["PYTHONPATH"] = f"{root}{os.pathsep}{environment.get('PYTHONPATH', '')}".rstrip(
+        os.pathsep)
+    print(f"[{kind}] starting the tracker ({module})", flush=True)
+    # Its own process group, so a ctrl-c in this terminal reaches the run and the tracker is
+    # stopped by `stop_tracker` below rather than dying halfway through a camera read.
+    process = subprocess.Popen(command, env=environment, cwd=root, start_new_session=True)
+    for _ in range(int(TRACKER_WAIT / 0.2)):
+        if tracker_running():
+            print(f"[{kind}] tracker is publishing; pinch to select", flush=True)
+            return process
+        if process.poll() is not None:
+            raise SystemExit(f"the tracker exited with {process.returncode} before publishing "
+                             f"anything -- run it on its own to see why:\n"
+                             f"    ./scripts/{'hand' if kind == 'hand' else 'gaze'}.sh --check")
+        time.sleep(0.2)
+    # Not fatal: a camera that takes its time, or a gaze tracker waiting to be calibrated, is
+    # still a tracker. The run goes on and the selector picks points up whenever they start.
+    print(f"[{kind}] no points yet after {TRACKER_WAIT:g}s -- carrying on; the run will use "
+          f"them as soon as there are any", flush=True)
+    return process
+
+
+def stop_tracker(process: Optional[subprocess.Popen]) -> None:
+    """Stop a tracker this run started. Never raises: the run is already ending."""
+    if process is None or process.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def build_selector(agent: Rocket2Agent, window, source_name: str, tracker: str = "gaze"):
+    """The gaze pipeline, pointed at `window` and sharing `agent`'s SAM-2.
+
+    Imported here for the same reason the window is: this pulls in the selector, which pulls
+    in the channel, and a run without --gaze should not pay for any of it.
+    """
+    from mcagents.perception.selection import (ChannelSource, GazeSelector, PointerSource,
+                                               ScreenMap, SelectorConfig)
+
+    if source_name == "pointer":
+        source = PointerSource(window)
+        print("[gaze] pointing with the mouse -- press C in the window to free it from the "
+              "camera", flush=True)
+    else:
+        source = ChannelSource()
+        script = "hand.sh" if tracker == "hand" else "gaze.sh"
+        how = ("pinch to select" if tracker_running(source.path)
+               else f"nothing is publishing yet -- ./scripts/{script} --check says why")
+        print(f"[{tracker}] reading points from {source.path} -- {how}", flush=True)
+    rect = window.pov_rect()
+    print(f"[gaze] the game view is {window.pov_size[0]}x{window.pov_size[1]} at "
+          f"{rect[:2] if rect else '?'} on screen", flush=True)
+    return GazeSelector(agent.masker, ScreenMap(window.pov_rect), source,
+                        SelectorConfig.from_env())
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -553,6 +740,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--listen", action="store_true",
                         help="after any plan, take goals from the voice client's spool and "
                              "keep going until the episode ends")
+    parser.add_argument("--play", action="store_true",
+                        help="play the game yourself between goals, in MineStudio's own "
+                             "window: WASD and the mouse are yours until a goal arrives, and "
+                             "yours again when it ends. Implies --listen, and replaces the "
+                             "OpenCV preview. MCAGENTS_GUI_SCALE sets how big the window is")
+    parser.add_argument("--gaze", action="store_true",
+                        help="point with your eyes: whatever you look at is segmented and "
+                             "outlined in red, and a goal that names no point runs against "
+                             "it. Implies --play, and starts the tracker itself")
+    parser.add_argument("--hand", action="store_true",
+                        help="point with a pinching index finger. Starts the hand tracker "
+                            "itself; --no-tracker uses one already running")
+    parser.add_argument("--no-tracker", dest="tracker", action="store_false", default=True,
+                        help="do not start the tracker; use one already publishing, from "
+                             "./scripts/hand.sh or ./scripts/gaze.sh in another terminal")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="camera device index for the hand tracker (default 0)")
+    parser.add_argument("--gaze-source", choices=["channel", "pointer"], default="channel",
+                        help="where looks come from: the tracker's channel (default), or the "
+                             "mouse, for trying the whole thing without calibrating one "
+                             "(press C in the window to free the mouse from the camera)")
     parser.add_argument("--idle-hz", type=float,
                         default=float(os.environ.get("MCAGENTS_IDLE_HZ", DEFAULT_IDLE_HZ)),
                         help=f"steps per second while --listen waits for a goal "
@@ -589,6 +797,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     if args.goal and args.plan:
         raise SystemExit("--goal and --plan both say what to do; pass one or the other")
+    # Each of these only means anything inside the next, so asking for the innermost is
+    # taken as asking for all of them rather than refused as an incomplete combination:
+    # the gaze overlay lives in the play window, and playing is something you do between
+    # goals, which only a run that waits for goals has.
+    if args.gaze or args.hand:
+        args.play = True
+    if args.play:
+        args.listen = True
     # --listen with nothing else asked for waits, rather than approaching a building first:
     # the default plan is a demo of pointing, and here the person is about to say what they
     # want. Given explicitly, a plan still runs and the listener picks up after it.
@@ -611,11 +827,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     resolver = PointResolver(targeter_backend(args))
 
+    # Before Minecraft, and before the model loads: the tracker needs a few seconds and the
+    # sim needs about a minute, so the pointing is warm by the time there is a world to point
+    # at. `--gaze-source pointer` needs no tracker at all -- the mouse is the tracker.
+    tracker: Optional[subprocess.Popen] = None
+    if (args.gaze or args.hand) and args.tracker and args.gaze_source == "channel":
+        tracker = start_tracker("hand" if args.hand else "gaze", args.camera)
+
     from minestudio.simulator.callbacks import PrevActionCallback, RecordCallback
 
     # 224x224 observations and a PrevActionCallback are both hard requirements of the
     # checkpoint; Rocket2Agent refuses a sim without them.
     callbacks = [PrevActionCallback()]
+    window = None
+    if args.play:
+        # Imported here rather than at module scope: it pulls in pyglet and imgui, which a
+        # headless run has no use for and a machine without a display cannot load.
+        from mcagents.minecraft.play import PlayWindow
+
+        window = PlayWindow()
+        # In *front* of PrevActionCallback, and that is not a preference. MinecraftSim
+        # chains before_step through the callbacks in order, each one handed what the last
+        # returned, and a human step arrives as the string "human" which PlayWindow turns
+        # into the action the keyboard actually asked for. Behind it, PrevActionCallback
+        # records the string instead, and fails on the next step trying to read keys off it.
+        callbacks.insert(0, window)
+        # One window, not two. The preview is the same frame drawn by a different toolkit,
+        # and a second OpenCV window in a process that now holds a pyglet one is exactly the
+        # libxcb collision mcagents/gui.py exists to avoid.
+        config.preview = False
     # MineStudio's RecordCallback keeps every frame in a list and encodes only on close:
     # ~0.7 MB a frame at 640x360. A plan is bounded by max_steps, so that is fine; --listen
     # has no end, and at 20 steps a second fills 30 GB of RAM in about half an hour and
@@ -630,9 +870,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         # writes the file in before_close, and Session closes the sim however the run ends.
         callbacks.append(RecordCallback(record_path="logs/rocket2", fps=20, frame_type="pov"))
 
+    try:
+        run(args, env, config, plan, resolver, callbacks, window)
+    finally:
+        stop_tracker(tracker)
+
+
+def run(args: argparse.Namespace, env: EnvConfig, config: Rocket2Config, plan: Plan,
+        resolver: "PointResolver", callbacks: List[Any], window) -> None:
+    """The session itself: open the sim, run the plan, then listen. Split out of `main` so the
+    tracker `main` started is stopped however this ends, without another level of nesting."""
     with Session(env) as session:
         sim = session.open(callbacks=callbacks, action_type="env", obs_size=(224, 224))
         agent = Rocket2Agent(sim, config)
+        # Built here rather than inside the agent because it needs to know where the game is
+        # *on screen*, which only the window knows -- and it shares the agent's SAM-2 rather
+        # than loading a second 455 MB copy of it onto the same card.
+        if args.gaze or args.hand:
+            agent.selector = build_selector(agent, window, args.gaze_source,
+                                            tracker="hand" if args.hand else "gaze")
+            window.paint(agent.selector.draw)
 
         # The agent only draws its preview after a step, so without this there is nothing on
         # screen until a goal is actually running -- and resolving the first point can take
@@ -641,18 +898,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if config.preview:
             gui.show(agent.overlay(), "ROCKET-2")
 
-        # run() would do a goal in one call; stepping by hand is what a planner does, so it
-        # can watch `visibility` fall and re-point instead of burning the budget.
-        for number, entry in enumerate(plan, 1):
-            if not run_goal(agent, resolver, entry, f"plan {number}/{len(plan)}"):
-                break
-        else:
-            if args.listen:
-                status = (StatusChannel(args.status_dir) if args.status_dir
-                          else StatusChannel())
-                listen(agent, resolver, GoalSpool(args.goal_dir or DEFAULT_GOAL_DIR),
-                       idle_hz=args.idle_hz, status=status,
-                       followup_window=args.followup_window, turn_step=args.turn_step)
+        try:
+            # run() would do a goal in one call; stepping by hand is what a planner does, so
+            # it can watch `visibility` fall and re-point instead of burning the budget.
+            for number, entry in enumerate(plan, 1):
+                if not run_goal(agent, resolver, entry, f"plan {number}/{len(plan)}"):
+                    break
+            else:
+                if args.listen:
+                    status = (StatusChannel(args.status_dir) if args.status_dir
+                              else StatusChannel())
+                    listen(agent, resolver, GoalSpool(args.goal_dir or DEFAULT_GOAL_DIR),
+                           idle_hz=args.idle_hz, status=status,
+                           followup_window=args.followup_window, turn_step=args.turn_step)
+        finally:
+            if agent.selector is not None:
+                agent.selector.close()
 
 
 if __name__ == "__main__":

@@ -125,7 +125,35 @@ than per-utterance.
 ```json
 {"text": "mine the diamond ore", "final": true}
 {"kind": "frame", "image": "<base64 jpeg, no data: prefix>"}
+{"text": "mine that", "final": true, "selection": {"point": [0.51, 0.42],
+  "box": [0.42, 0.31, 0.60, 0.78], "locked": true, "held": true, "age": 1.4}}
+{"kind": "frame", "image": "...", "selection": {"point": [0.51, 0.42], "...": "as above"}}
 ```
+
+### "mine *that*": the coordinate travels with the words
+
+A `selection` is what the person is pointing at — the box `--hand` or `--gaze` put around it,
+as fractions of the frame, with `point` its centre. `locked` means they held it long enough to
+mean it. `held` is `false` while they are still pointing and `true` for the few seconds the
+agent keeps it afterwards (`MCAGENTS_SELECTION_HOLD_MS`), `age` being the seconds since the
+pointing stopped — the hold exists because the hand opens the moment someone starts talking,
+long before a spoken task can be answered.
+
+It rides on **both** kinds of message, and the utterance is the one that matters. Frames have
+carried it for a while, but a frame is up to `AGENT_FRAME_INTERVAL` old and arrives as its own
+message, so the model had to work out for itself which picture "that" belonged to. Stamped
+onto the final — at *queue* time, so it is the point from when the phrase ended and not from
+whenever the socket got around to it — the words and the coordinate are one message. Every
+final prints with it, which is how to tell at a glance that the pointing half went:
+
+```
+  sent: mine that [pointing at 0.51, 0.42 held]   (asr 141 ms . end->sent 156 ms)
+```
+
+Pointing at nothing is not an error: the words go without a coordinate, because plenty of what
+gets said names its own target. So the model has both halves — which object, and what to do
+with it — and its reply is a goal with an `interaction` and **no `point`**, which ROCKET-2 runs
+against the pointed object.
 
 Partials go too, as `final: false`. The server enqueues an utterance only on `final: true`
 and ignores the rest, so today they cost nothing — and endpointing and barge-in will both
@@ -433,6 +461,7 @@ is otherwise a 1008 you will spend an evening on; quote the value to keep it byt
 | `AGENT_FRAME_INTERVAL` | `3.0` | seconds between frames on the wire |
 | `MCAGENTS_FRAME_PATH` | `/tmp/mcagents-frame.jpg` | the seam; **both** processes read it |
 | `MCAGENTS_FRAME_INTERVAL` | `1.0` | the *agent* side: seconds between publishes, `0` disables |
+| `MCAGENTS_SELECTION_HOLD_MS` | `5000` | the *agent* side: how long a pointed-at object stays usable after the pinch opens; `0` needs a live one |
 | `AGENT_GOAL_WS_URL` | unset | the second tunnel: goals for ROCKET-2. Unset means no agent is driven |
 | `MCAGENTS_GOAL_DIR` | `/tmp/mcagents-goals` | the goal queue; **both** processes read it |
 | `MCAGENTS_STATUS_DIR` | `/tmp/mcagents-status` | goal statuses from ROCKET-2, sent up the goal tunnel; **both** processes read it |

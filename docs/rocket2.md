@@ -76,14 +76,32 @@ controller can drive the other:
 | `{"item": "log", "count": 3}` | 3 more of that item in the inventory since the goal started |
 | `{"item": "log", "count": 3, "mode": "total"}` | 3 in the inventory in absolute terms |
 | `{"stat": "mine_block", "match": "log", "count": 3}` | 3 more on Minecraft's own stat counters (`mine_block`, `kill_entity`, `craft_item`, `pickup`, `use_item`, `damage_dealt`) |
+| `{"arrive": {"distance": 3}}` | the agent is within 3 blocks of the target's world position |
 | `{"arrive": {"width": 0.6}}` | the locked target's box is ≥ 60% of the frame wide (`height` works too; `true` = the default width, a bare number = a width). Combines with any row above as "whichever first" |
 | `lambda agent: ...` | anything else; gets the agent, returns a bool |
 
 **Approach arrives by default.** An Approach whose `stop` says nothing about arriving —
-`null`, a step count, or a dict with no `arrive` — gets `"arrive": {"width": 0.6}` added
-(`ROCKET2_ARRIVE_WIDTH`), so it ends when it gets there rather than when its budget runs out.
-`"arrive": false` turns that off. A target that already fills the width ends the goal as
-`arrived` before any action is taken.
+`null`, a step count, or a dict with no `arrive` — gets
+`"arrive": {"distance": 3, "width": 0.6}` added (`ROCKET2_ARRIVE_DISTANCE`,
+`ROCKET2_ARRIVE_WIDTH`), so it ends when it gets there rather than when its budget runs out.
+`"arrive": false` turns that off. A target that is already there ends the goal as `arrived`
+before any action is taken.
+
+**Arrival is measured in blocks where it can be.** Apparent size is not distance: a box
+fills the frame when the agent is close to its target, but also when the agent has turned
+until the target crops the edge of the view, and it shrinks again the moment the agent walks
+past. So the pointed pixel is cast through the voxel grid around the player
+([mcagents/minecraft/ranging.py](../mcagents/minecraft/ranging.py)) to the first solid block
+it meets, and the goal remembers that block's coordinates — its *anchor*. From then on
+`distance` is `|player_pos − anchor|` measured horizontally, which turning cannot change and
+walking past cannot fake, and it is the whole answer: `width` only stands in where there is
+no anchor.
+
+There are two ways to have no anchor. The grid only reaches `MC_VOXELS` (7) blocks, so a
+building down the street casts to nothing — the cast is retried every step, and the anchor
+lands by itself as the agent walks into range. And a sim built without `Session`, or with
+`MC_VOXELS=0`, has no `info["voxels"]` at all; there `width` is all there is, as before.
+`agent.status()` reports both `anchor` and `range` (blocks), or `null` for each.
 
 **Approach locks its target.** ROCKET-2 steers by one goal image, and near the target that
 image stops resembling the view — which is when it would drift onto a lookalike down the
@@ -216,6 +234,27 @@ Minecraft is off OWLv2's training distribution, so scores run low — `MCAGENTS_
 (default 0.1) is worth tuning against your own frames. Measured on the city spawn frame:
 `"street lamp"` 0.19, `"building"` 0.13, `"road"` 0.12, and `"tree"`, `"wall"` and `"door"`
 no match at all.
+
+A fourth answer skips `locate` entirely: point with a hand, or with your eyes. `--hand` (or
+`--gaze`) segments whatever you pinch at into the mask ROCKET-2 takes as its goal, and a goal
+that arrives carrying **no `point`** runs against it — which is how "mine that" works without
+anything having to re-derive which tree *that* was.
+
+One flag, one terminal: `--hand` starts the tracker itself, in its own virtualenv
+(`.gaze-env`, because it needs numpy 2 and opencv 5 where the sim has 1.26 and 4.8), waits up
+to 20 s for its first point, and stops it when the run ends. `--camera N` picks the device;
+`--no-tracker` uses one already publishing, which is what `./scripts/hand.sh --check` in
+another terminal is for when the camera itself is the thing being debugged.
+
+The committed selection outlives the pointing by `MCAGENTS_SELECTION_HOLD_MS` (5 s), and it
+has to. The selector drops a lock 250 ms after the pinch opens, while the round trip from a
+spoken phrase to a goal coming back down the goal tunnel is the ASR final, the client's join
+window, the wire, the remote model and the spool poll — seconds. So you pinch, let go, and
+talk; the goal that lands runs on what you were pointing at, and the terminal says
+`Mine the object you are pointing at (330, 190) (held 1.4s)` when it used the hold rather than
+a live box. Past the window the goal is refused `no_target` rather than aimed at something
+nobody chose. The frame published for the model carries the same box, with `held` and `age`
+beside it so it can tell live pointing from remembered pointing.
 
 That last one is a trap worth knowing about. [`city.py`](../mcagents/minecraft/city.py) puts
 the park *beside* spawn so there would be an oak to point at, but nothing pins which way the

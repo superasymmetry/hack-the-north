@@ -105,6 +105,17 @@ PATCHES = [
             "                time.sleep(0.01)\n"
         ),
     },
+    {
+        # Not a bug -- a constant that has to be configurable for gaze selection to work.
+        # The window is 640*SCALE wide, and SCALE is hardcoded to 2, i.e. a 1280x810 view of
+        # the game. Gaze accuracy is an *angle*, so how many frame pixels it costs depends
+        # entirely on how large the view is on screen: ~104 screen px of error is 52 frame px
+        # at SCALE=2 and 26 at SCALE=4. See docs/gaze.md.
+        "name": "constants.py: GUI window scale hardcoded to 2 (gaze needs a bigger view)",
+        "file": MINESTUDIO_DIR / "simulator/utils/constants.py",
+        "old": "        self.SCALE = 2\n",
+        "new": '        self.SCALE = int(__import__("os").environ.get("MCAGENTS_GUI_SCALE", 2))\n',
+    },
 ]
 
 
