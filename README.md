@@ -1,131 +1,26 @@
-# mcagents
+# ~ Let me do it for you ~
 
-Goal-conditioned Minecraft agents on top of [MineStudio](https://github.com/CraftJarvis/MineStudio).
-Two controllers share one environment stack, and differ only in how you tell them what to do:
+## Inspiration
+Google Deepmind's SIMA 2: https://deepmind.google/blog/sima-2-an-agent-that-plays-reasons-and-learns-with-you-in-virtual-3d-worlds/
+and Thinking Machines Lab's interaction models: https://thinkingmachines.ai/blog/interaction-models/ 
 
-| controller | goal channel | runs where |
-|---|---|---|
-| [**ROCKET-2**](docs/rocket2.md) | a point + an interaction type (`[420, 190]`, `"Mine"`) | this GPU, ~33 FPS |
-| [**JarvisVLA**](docs/jarvisvla.md) | an English sentence (`"Chop down the oak log."`) | a 7B VLM on the GPU box, over HTTP |
+## What it does
+~ Does things for you ~ (let me do it for you)
+Plays your minecraft for you in real time, while roasting you in the process.
 
-Both take the same `stop` vocabulary — a step budget, an inventory target, a game statistic,
-or a predicate — so a planner that can drive one can drive the other.
+## How we built it
+I have a lot of GPUs through my uni. Through inferencing open-source models on vLLM with continuous batching in different threads, the agent could achieve an illusion of real-time interaction.
 
-```python
-from mcagents.agents.rocket2 import Rocket2Agent
+## Challenges we ran into
+- fast communication between the local client and remote GPUs
+- had to set up cloudflare tunnel
+- model for short horizon task was inaccurate
 
-agent = Rocket2Agent(sim)
-result = agent.run(point=[420, 190], interaction="Mine", stop={"item": "log", "count": 3})
-print(result)      # item after 143 steps (11.4s), gained oak_log+3, visibility 0.87
-```
+## Accomplishments that we're proud of
+- this project is super funny
 
-## Quickstart
+## What we learned
+- never let a doggo do something for you
 
-```bash
-conda activate ./.conda-env
-
-bash scripts/build_world.sh              # once: cache a world, saves ~13s of every reset
-bash scripts/bake_city.sh                # once: bake the city into it, saves ~10s more
-bash scripts/rocket2.sh                  # ROCKET-2, launching its own Minecraft
-
-bash scripts/mc_server.sh                # or: hold one Minecraft open, in its own terminal
-MC_PORT=9000 bash scripts/rocket2.sh     #      and attach to it, as often as you like
-
-MC_PORT=9000 bash scripts/rocket2.sh --listen   # ...or let it take goals from your voice
-./scripts/local_client.sh                       #    in a second terminal. See below.
-```
-
-Talking to it is [docs/local-client.md](docs/local-client.md): the laptop sends speech and
-the agent's own view up one tunnel, and the model sends conversation back down it and goals
-for ROCKET-2 down a second. `--listen` is the agent end of that loop.
-
-For JarvisVLA, start the policy on the GPU box first and tunnel to it — see
-[docs/jarvisvla.md](docs/jarvisvla.md):
-
-```bash
-export JARVISVLA_URL=http://127.0.0.1:8000/v1
-./scripts/jarvisvla.sh
-```
-
-Anything you would otherwise export can go in a `.env` at the repo root instead —
-`cp .env.example .env` — which `scripts/env.sh` loads for every wrapper. It is gitignored,
-so it is also where the agent token belongs. Your shell still wins over it for one-offs.
-
-The city — streets, fourteen buildings you can walk into, a park, a fountain plaza — can
-arrive two ways. `CityCallback` builds it with ~430 chat commands after every reset; `bash
-scripts/bake_city.sh` writes the same city into a world zip once, by editing the save files
-directly, and a run then just loads it. Measured on this machine, that is **15.1s a reset
-down to 5.1s**. `Session` prefers a baked world when one exists, so `--city` picks it up
-with no further ceremony. See [mcagents/minecraft/bake.py](mcagents/minecraft/bake.py).
-
-A run works through a *plan*: a JSON list of goals, one per entry. The defaults live at the
-top of each runner (`mcagents/cli/rocket2.py`, `mcagents/cli/jarvisvla.py`); `--plan
-my_plan.json` takes your own.
-
-```json
-[
-  {"point": "building", "interaction": "Approach", "stop": {"steps": 300}}
-]
-```
-
-## Layout
-
-```
-mcagents/
-  agents/         the controllers
-    base.py         one goal at a time, stop conditions, results -- shared by both
-    rocket2.py      point + interaction -> control
-    jarvisvla.py    sentence -> control (vLLM client)
-    jarvisvla_actions.py   its action-token codec, separately testable
-  perception/     turning a frame into somewhere to point
-    owlv2.py        open-vocabulary detection, local
-    vlm.py          the same contract against a remote Qwen2.5-VL
-    masking.py      SAM-2: point -> mask
-  minecraft/      the environment side
-    session.py      boot or attach, load the cached world, build the sim
-    instance.py     hold one Minecraft open across runs (saves ~12s a reset)
-    world.py        cache generated terrain to a zip (saves ~13s a reset)
-    city.py         lay a city over the world, so there is somewhere to go
-    bake.py         ...or build that same city into the world zip, once, offline
-    anvil.py        region files: chunks, palettes, packed block states
-    nbt.py          the format all of that is written in
-    inventory.py    reading items and statistics out of `info`
-  cli/            entry points: python -m mcagents.cli.<name>
-  voice.py        microphone -> English -> a streamed reply (Moonshine, CPU-only)
-  local_client.py microphone + game view out, conversation + goals back
-  frames.py       the latest frame, from the process with the sim to the one with the socket
-  goals.py        ...and the goals coming the other way, queued for the process with the sim
-  vendor/         third-party sources, regenerated by scripts/setup/
-scripts/          shell wrappers that set the env up and call the CLI
-  setup/          one-time install: minestudio patches, vendoring ROCKET-2
-tests/            python tests/test_*.py -- no pytest needed
-docs/             setup, the MineStudio API, and one page per controller
-worlds/           cached world zips (built, not committed)
-```
-
-## Docs
-
-- [docs/setup.md](docs/setup.md) — the machine: conda, JDK, VirtualGL, GPU rendering, the
-  minestudio bugs this repo patches, and where reset latency goes.
-- [docs/rocket2.md](docs/rocket2.md) — the pointed controller and how to point it.
-- [docs/jarvisvla.md](docs/jarvisvla.md) — the sentence controller, the server, the tunnel,
-  and three ways it fails silently.
-- [docs/voice.md](docs/voice.md) — talking to it: Moonshine v2 on the CPU, why not Whisper,
-  and running it while a rollout holds the GPU.
-- [docs/local-client.md](docs/local-client.md) — the capture side on the laptop: running
-  the whole voice loop, the wire protocol both ways, sending the game view alongside the
-  words, why not faster-whisper (measured), and what survives a reconnect.
-- [docs/minestudio-api.md](docs/minestudio-api.md) — MineStudio's own API, verified against
-  the installed source with file:line references.
-
-## Tests
-
-Neither needs a running Minecraft.
-
-```bash
-python tests/test_jarvisvla_actions.py   # action decoder; no GPU, no server
-python tests/test_rocket2_agent.py       # the agent against a stub sim; real weights, ~30s
-python tests/test_bake_city.py           # the offline world editor, against worlds/plains.zip
-python tests/test_voice.py               # the voice module's LLM leg; no mic, no server
-python tests/test_local_client.py        # the socket: reconnect, auth, backpressure, frames
-```
+## What's next for Let me do it for you
+- do it yourself
